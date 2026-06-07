@@ -100,7 +100,12 @@ interface ReportPayload {
     body: string;
   }>;
 
-  // ===== DCF SCENARIOS =====
+  // ===== INDUSTRY TYPE (optional, default "non-bank") =====
+  // When "bank", populate `bank_valuation` below and leave `dcf_scenarios` empty.
+  // For everything else, use `dcf_scenarios` and leave `bank_valuation` unset.
+  industry_type?: "bank" | "non-bank";
+
+  // ===== DCF SCENARIOS (non-bank only) =====
   dcf_scenarios: Array<{
     scenario: "Bear" | "Base" | "Bull";
     wacc: string;                    // "10.0%"
@@ -108,6 +113,35 @@ interface ReportPayload {
     fcf_path: string;                // "+35/+28/+20/+15/+10%"
     implied_px: number;
   }>;
+
+  // ===== BANK VALUATION (banks only) =====
+  // Populate this block for banks via the `banking-ddm` skill. Leave
+  // `dcf_scenarios` empty when `industry_type` is "bank".
+  bank_valuation?: {
+    cost_of_equity_pct: number;          // Ke via CAPM
+    risk_free_rate_pct: number;          // local 10Y govt bond
+    equity_risk_premium_pct: number;
+    beta: number;
+    beta_warning?: string;               // present if yfinance beta was sanitized
+    current_dividend_per_share: number;  // normalized D0 (special divs filtered)
+    d0_method: string;                   // how D0 was estimated
+    book_value_per_share: number;
+    roe_pct: number;
+    current_pb: number;
+    ddm_high_growth_pct: number;         // years 1-5
+    ddm_terminal_growth_pct: number;
+    ddm_implied_px: number;
+    excess_returns_implied_px: number;
+    justified_pb_ratio: number;          // (ROE - g) / (Ke - g)
+    justified_pb_implied_px: number;     // ratio x BV per share
+    blended_implied_px: number;          // 40/40/20 weighted across the three
+    upside_pct: number;                  // blended vs current
+    sensitivity: {
+      ke_range_pct: number[];            // 5 points around central Ke
+      g_range_pct: number[];             // 5 points around central g_terminal
+      implied_px_matrix: (number | null)[][];
+    };
+  };
 
   // ===== SYNTHESIS — 3 paths =====
   synthesis_paths: Array<{
