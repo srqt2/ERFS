@@ -1,83 +1,154 @@
 # ERFS — Equity Research Finance Skills workspace
 
-A portable Claude Code workspace for single-ticker equity research. Pairs the public [`himself65/finance-skills`](https://github.com/himself65/finance-skills) plugin suite with a small set of custom orchestrating agents (alpha, charlie, kilo, delta).
+Portable Claude Code workspace for single-ticker equity research. Produces **identical output shape** across every Claude environment (desktop, web, mobile, friend's laptop) because the math layer is locked Python scripts, not LLM-drafted prose.
 
-## What it does
+## The output contract
 
-You ask Claude to research a ticker. Alpha dispatches two independent lanes:
+Every research cycle produces **three files** per ticker in `output/<TICKER>/`:
 
-- **Charlie** writes the bull case. 8-10 quantified catalysts.
-- **Kilo** writes the bear case in parallel, never seeing Charlie's draft. 8-10 thesis-breakers.
-
-Alpha synthesizes both into a recommendation with a 12-month target and three probability-weighted paths. **Delta** runs a numerical audit if the output is numbers-heavy (DCF, multiples, growth rates).
-
-Output is structured JSON. Convert to PDF or DOCX with the `pdf` and `docx` skills if you want a document deliverable.
-
-## Why this layout
-
-- `.claude/agents/` holds the four orchestrating agents. Committed to this repo.
-- `.claude/skills/` is a mount point for plugin skills. The `SessionStart` hook clones `himself65/finance-skills` into `.claude/skills/finance-skills` on every session start. It is gitignored so the public skill code is never duplicated into your repo.
-
-This means:
-
-1. You can run from your laptop, phone, or a friend's Claude web session against this repo
-2. The finance skills are always fresh from upstream
-3. The workspace stays small (only your agents + config are in git)
-
-## Quick start
-
-In a fresh session opened against this repo, Claude will see something like:
-
-```
-[hook output]
-Cloning into '.claude/skills/finance-skills'...
-Receiving objects: 100% (...)
-```
-
-Then ask:
-
-> research CLS
-
-Alpha will run the cycle and write `output/<TICKER>/<TICKER>.json` plus a markdown bundle.
-
-## Deliverables
-
-Three output shapes, depending on what you ask for:
-
-| Shape | Skill used | When to ask for it |
+| File | What it is | Produced by |
 |---|---|---|
-| Structured JSON | none, alpha writes directly | Feed into a UI or another tool |
-| PDF report (mobile-friendly A4) | `anthropic-skills:pdf` | Read on phone, archive, share |
-| DOCX | `anthropic-skills:docx` | Edit, hand off to a pitch deck team |
+| `<TICKER>.json` | Narrative report — thesis, catalysts, bear case, peers, business overview, key risks | LLM (you / your friend) |
+| `<TICKER>_valuation.json` | Pure math — assumptions with reasoning, scenarios with probabilities, full calculation trace, sensitivity matrix | Python compute scripts |
+| `<TICKER>.xlsx` | 8-tab Excel workbook | `_schema/render_excel.py` (locked template) |
 
-For collaborators using this repo via Claude web, the recommended flow is: produce a PDF or DOCX, share the file. Avoid handing out write access to downstream deploy targets.
+**Same input JSON → same Excel byte-for-byte.** That's the whole point. No agent ever touches Excel layout or invents valuation math.
 
-## Skills covered
+The Excel has 8 tabs in a fixed order:
 
-Once the SessionStart hook completes, these skills are available (full list at [himself65/finance-skills](https://github.com/himself65/finance-skills)):
+1. **Cover** — ticker, recommendation, target, headline thesis
+2. **Assumptions** — every input cell with reasoning column (editable)
+3. **Calculation** — DCF/DDM math results
+4. **Formula trace** — step-by-step derivation of every number
+5. **Sensitivity** — WACC × g_terminal (DCF) or Ke × g_terminal (DDM) grid
+6. **Scenarios** — Bear / Base / Bull with probability weights + final blended target math
+7. **Peers** — peer comparables table
+8. **Reasoning log** — narrative explaining why this method, these assumptions, these peers
 
-- `finance-market-analysis` — DCF, relative multiples, SOTP, earnings preview/recap, estimate analysis, stock correlation, stock liquidity, ETF premium, options payoff, SaaS valuation, SEPA strategy, yfinance data
-- `finance-data-providers` — Adanos sentiment, Funda AI MCP, TradingView reader, Hormuz strait monitor
-- `finance-social-readers` — X / Discord / LinkedIn / Telegram / YC / opencli fallback
-- `finance-startup-tools` — multi-perspective startup analysis
-- `finance-ui-tools` — generative UI design system
-- `finance-skill-creator` — skill scaffolding and eval
+## Quick start (you / your friend)
 
-## API keys you may want to set
+Open a fresh Claude Code session against this repo. On the first user message, the SessionStart hook clones `himself65/finance-skills` into `.claude/skills/finance-skills/`. Then type a ticker:
 
-Optional environment variables that unlock more depth:
+```
+NVDA
+```
+
+or
+
+```
+research Broadcom
+```
+
+or anything that reads as "I want a report on X". Claude follows `CLAUDE.md`'s 10-step pipeline:
+
+1. Verifies price via `finance-market-analysis:yfinance-data`
+2. Invokes `equity-bull-case` skill → writes `output/<T>/<T>_bull.json` (8-10 catalysts, business facts, bull valuation lens)
+3. Invokes `equity-bear-case` skill — **does not read the bull file** → writes `output/<T>/<T>_bear.json` (8-10 thesis-breakers, bear paragraph, key risks)
+4. Synthesizes both into `output/<T>/<T>.json` (the narrative)
+5. Picks valuation method:
+   - **DCF** for FCF-generating non-banks
+   - **DDM** for banks
+   - **SOTP** for multi-segment conglomerates
+6. Writes `output/<T>/<T>_inputs.json` with every assumption and per-input reasoning, scenarios with probability + probability_reasoning, weights_reasoning at top
+7. Runs the appropriate Python compute script (deterministic math):
+   ```bash
+   python _schema/dcf_compute.py --inputs output/<T>/<T>_inputs.json --output output/<T>/<T>_valuation.json
+   # or
+   python _schema/ddm_compute.py --inputs output/<T>/<T>_inputs.json --output output/<T>/<T>_valuation.json
+   # or
+   python _schema/sotp_compute.py --inputs output/<T>/<T>_inputs.json --output output/<T>/<T>_valuation.json
+   ```
+8. Optionally invokes `equity-audit` skill if the output is numbers-heavy
+9. Voice-cleans the narrative:
+   ```bash
+   python _schema/voice_clean.py output/<T>/<T>.json
+   ```
+10. Renders the Excel artifact:
+    ```bash
+    python _schema/render_excel.py --ticker <T> --category AI
+    ```
+
+Three files land in `output/<TICKER>/`. The Excel has the 8-tab locked layout described above. The agent should report the file paths + the headline (recommendation, target, top-line thesis) — no inline report dump.
+
+## Critical rules for your Claude session
+
+**DO NOT** ask Claude to produce a PDF or DOCX directly via `anthropic-skills:pdf` / `anthropic-skills:docx` skills — those produce freeform output that diverges from the locked template. The Excel **is** the deliverable. If you need a PDF for sharing, future versions of this workspace will include `_schema/render_pdf.py` that renders from the same JSON.
+
+**DO NOT** ask Claude to write the report inline in chat. The deliverables are the three files in `output/<TICKER>/`. Claude should only return file paths + a one-paragraph headline.
+
+**DO NOT** ask Claude to "use a different valuation method" mid-flight. The method is chosen at step 5 and every compute script is deterministic for that method.
+
+**DO** open Excel and edit the Assumptions tab when you want to flex the model. Numbers recalculate automatically (the formulas live in the workbook).
+
+**DO** ask Claude to re-run a ticker if assumptions need revision — Claude rewrites `<T>_inputs.json`, re-runs the compute script, re-renders Excel. Narrative stays unless you specifically ask for a refresh.
+
+## What makes outputs identical across sessions
+
+| Layer | Variability | Why |
+|---|---|---|
+| `yfinance-data` (price, financials) | Very low (~99% same) | Same yfinance call returns same data given same date |
+| Valuation method choice | Locked by company type | DCF for non-banks, DDM for banks |
+| Valuation math | **Zero variance** | Python compute scripts; same inputs always produce same outputs |
+| Bull/bear narrative (catalysts, breakers) | High by design | Different lenses make the cross-check real |
+| Excel layout | **Zero variance** | `render_excel.py` uses a locked 8-tab template |
+
+The **narrative breathes** (your friend's bull case will read differently from yours — that's the feature). The **math is pinned** (same Excel layout, same JSON shape, same computed numbers given matching inputs).
+
+## Layout
+
+```
+.claude/
+├── agents/
+│   └── alpha.md            (legacy reference; the real orchestration is in CLAUDE.md)
+├── skills/
+│   ├── .gitkeep            (placeholder so the folder ships)
+│   ├── banking-ddm/        bank valuation skill (DDM + Excess Returns + Justified P/B)
+│   ├── equity-bull-case/   bull case generator skill
+│   ├── equity-bear-case/   bear case generator skill (instructed NOT to read bull file)
+│   └── equity-audit/       numerical audit skill
+└── settings.json           SessionStart hook that clones himself65/finance-skills
+
+_schema/
+├── SPEC_v2.md              narrative JSON schema (industry_type, etc.)
+├── VALUATION_SCHEMA.md     valuation JSON schema (scenarios, weights, calculation_trace)
+├── VOICE.md                prose rules (zero em-dashes, no AI tells)
+├── dcf_compute.py          DCF math engine (deterministic)
+├── ddm_compute.py          DDM + Excess Returns + Justified P/B (deterministic)
+├── sotp_compute.py         Sum of parts (multi-segment)
+├── voice_clean.py          regex-based em-dash + AI-tell scrubber
+└── render_excel.py         locked-template Excel renderer
+
+output/<TICKER>/
+├── <TICKER>.json           narrative
+├── <TICKER>_inputs.json    LLM-supplied valuation assumptions
+├── <TICKER>_valuation.json computed math (read this for the formula trace)
+└── <TICKER>.xlsx           8-tab Excel
+
+CLAUDE.md                   the contract Claude reads on session start
+README.md                   this file
+```
+
+## API keys (optional)
+
+Skills degrade gracefully if absent. Add to `data_gaps` in the narrative if missing.
 
 | Variable | Unlocks |
 |---|---|
-| `FUNDA_API_KEY` | Funda AI REST endpoints (analyst-grade research, transcripts, supply chain, ownership flow) |
-| `ADANOS_API_KEY` | Cross-source sentiment (Reddit / X / news / Polymarket) |
+| `FUNDA_API_KEY` | Funda AI REST endpoints (10-K segment splits, transcripts, supply chain, ownership flow) |
+| `ADANOS_API_KEY` | Adanos cross-source sentiment (Reddit / X / news / Polymarket) |
 
-Skills degrade gracefully without these. They will log a `data_gaps` note and continue.
+## How to know your output matches mine
 
-## Mandatory contract
+If yours and mine produce different reports on the same ticker:
 
-Every research cycle runs Charlie + Kilo in parallel. Kilo never sees Charlie's draft. This is the project rule for honest bear cases. Do not bypass it.
+1. **Diff the `<TICKER>_inputs.json` files.** The math is deterministic given inputs — different outputs imply different assumptions, and the difference is visible cell-by-cell in the inputs file.
+2. **Diff the Excel files.** They should have identical 8-tab structure with the same row/column layout. Different values are fine (different assumptions); different layout means the renderer ran differently somehow.
+3. **Check Claude followed `CLAUDE.md`.** If Claude went conversational instead of producing files, the session deviated from the contract. Re-prompt: "produce the three files per the CLAUDE.md contract."
 
-## Sharing this workspace
+If the layout is different, that's a bug — file an issue or tell the repo owner (Jan).
 
-The workspace repo is public. Friends with Claude web access can open a session against the GitHub URL, run research, and hand back a PDF or DOCX. They do not need any of your downstream deploy credentials.
+## Live published version
+
+The repo owner publishes selected reports to https://intellidesk-nu.vercel.app/research. The Vercel `/valuation` pages show the same data shape that your Excel exports — narrative, assumptions with reasoning, scenarios with probability weights, formula trace, sensitivity matrix, downloadable Excel.
+
+You can use those live pages as the canonical "what right looks like" reference if your Claude session output ever looks off.

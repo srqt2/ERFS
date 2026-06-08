@@ -2,15 +2,31 @@
 
 You are running in a workspace for producing pitch-deck-level research reports on individual public stocks.
 
+## STOP — read this before doing anything else
+
+If the user typed a ticker (or "research X" / "do X" / a company name), you MUST follow the contract below. **There is no other workflow.** Do not improvise. Do not paste a report inline. Do not call `anthropic-skills:pdf` to produce a freeform PDF. Do not invent valuation math.
+
+Two analysts running the same ticker should produce identical Excel layouts and identical computed numbers given matching inputs. That only holds if every session follows this contract exactly.
+
 ## Output contract (mandatory)
 
 Every research request produces **three files** in `output/<TICKER>/`:
 
 1. **`<TICKER>.json`** — narrative report (thesis, catalysts, bear case, peers, business overview, etc). Matches `_schema/SPEC_v2.md`.
-2. **`<TICKER>_valuation.json`** — pure math (assumptions, computed outputs, scenarios with probabilities, sensitivities). Matches `_schema/VALUATION_SCHEMA.md`. Produced by a compute script.
-3. **`<TICKER>.xlsx`** — Excel artifact rendered from the two JSONs by `_schema/render_excel.py`.
+2. **`<TICKER>_valuation.json`** — pure math (assumptions with reasoning, scenarios with probabilities + reasoning, computed outputs, calculation_trace, sensitivity matrix). Matches `_schema/VALUATION_SCHEMA.md`. **Produced by running a Python compute script** — never by Claude inventing numbers.
+3. **`<TICKER>.xlsx`** — Excel artifact rendered from the two JSONs by `_schema/render_excel.py`. **Locked 8-tab template** — never produced by `anthropic-skills:xlsx` or any other freeform Excel skill.
 
-Do not paste the report inline in chat. Produce these three files. They are the deliverables.
+After producing the three files, Claude returns ONLY:
+- The three file paths
+- A one-paragraph headline (recommendation + target + top-line reason)
+
+Do not include the JSON, the prose, the catalysts, or any other content inline in chat. The deliverables are the files.
+
+## Why this contract exists — read carefully
+
+This workspace is designed so two different Claude sessions (your desktop, your friend's web session, your phone) produce **identical output shape** on the same ticker. The narrative will read differently (different lenses, different angles — that's the feature). The math will be identical when inputs match (because Python is deterministic). The Excel layout will be identical (because `render_excel.py` uses a locked template).
+
+If your output diverges in layout (different sheet count, different sheet names, different cell organization), you broke the contract. Re-read this file and try again.
 
 ## How to handle the user's first message
 
