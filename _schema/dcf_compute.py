@@ -146,11 +146,9 @@ def main():
     g_range = [round(g_base + delta, 4) for delta in [-0.010, -0.005, 0.0, 0.005, 0.010]]
     sens_matrix = compute_sensitivity(primary_inputs, net_debt_b, shares_b, wacc_range, g_range)
 
-    # Scenarios
+    # Scenarios — each has its own probability + reasoning
     scenarios_out = []
     base_px_for_blend = base_outputs["implied_px"]
-    bull_px = base_px_for_blend
-    bear_px = base_px_for_blend
     for scen in data.get("scenarios", []):
         scen_inputs = json.loads(json.dumps(primary_inputs))
         kc = scen.get("key_changes", {})
@@ -174,12 +172,10 @@ def main():
             "label": scen["label"],
             "key_changes": kc,
             "implied_px": scen_px,
+            "probability": scen.get("probability"),
+            "probability_reasoning": scen.get("probability_reasoning", ""),
             "reasoning": scen.get("reasoning", ""),
         })
-        if scen["label"] == "Bull" and scen_px is not None:
-            bull_px = scen_px
-        elif scen["label"] == "Bear" and scen_px is not None:
-            bear_px = scen_px
 
     # Cross-check
     cross_check_out = None
@@ -194,16 +190,42 @@ def main():
             "outputs": cc_outputs,
         }
 
-    # Blend
-    weights = data.get("blending_weights") or {"Base": 0.60, "Bull": 0.20, "cross_check": 0.20}
-    cc_px = cross_check_out["outputs"]["implied_px"] if cross_check_out else base_px_for_blend
-    blended = (
-        weights.get("Base", 0) * base_px_for_blend +
-        weights.get("Bull", 0) * bull_px +
-        weights.get("Bear", 0) * bear_px +
-        weights.get("cross_check", 0) * cc_px
-    )
+    # Blend — probabilities live on each scenario; cross_check weight at top level.
+    # New protocol: sum of scenario.probability + blending_weights.cross_check should equal 1.0.
+    weights = data.get("blending_weights") or {}
+    cc_weight = weights.get("cross_check", 0)
+    cc_px = cross_check_out["outputs"]["implied_px"] if cross_check_out else None
+
+    # Sum of scenario contributions
+    weighted_contribs = []
+    scenario_weight_total = 0.0
+    for s in scenarios_out:
+        prob = s.get("probability")
+        if prob is None or s.get("implied_px") is None:
+            continue
+        contrib = prob * s["implied_px"]
+        weighted_contribs.append({
+            "component": s["label"],
+            "implied_px": s["implied_px"],
+            "weight": prob,
+            "contribution": round(contrib, 2),
+            "reasoning": s.get("probability_reasoning", ""),
+        })
+        scenario_weight_total += prob
+
+    if cross_check_out and cc_weight > 0 and cc_px is not None:
+        contrib = cc_weight * cc_px
+        weighted_contribs.append({
+            "component": cross_check_out["name"],
+            "implied_px": cc_px,
+            "weight": cc_weight,
+            "contribution": round(contrib, 2),
+            "reasoning": cross_check_out.get("reasoning", ""),
+        })
+
+    blended = sum(c["contribution"] for c in weighted_contribs)
     upside_pct = (blended - current_price) / current_price * 100 if current_price else None
+    weight_total = scenario_weight_total + cc_weight
 
     valuation = {
         "schema_version": "1.0",
@@ -230,8 +252,11 @@ def main():
         "cross_check": cross_check_out,
         "scenarios": scenarios_out,
         "blended_target": round(blended, 2),
-        "blending_logic": data.get("blending_logic", "") or f"Default weights: Base 60% + Bull 20% + cross_check 20%",
+        "blending_logic": data.get("blending_logic", ""),
         "blending_weights": weights,
+        "weights_reasoning": data.get("weights_reasoning", ""),
+        "weighted_contributions": weighted_contribs,
+        "weight_total_check": round(weight_total, 4),
         "upside_pct": round(upside_pct, 1) if upside_pct is not None else None,
     }
 

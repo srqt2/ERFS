@@ -63,9 +63,38 @@ Any valuation method (DCF, DDM, SOTP, Multiple) shares this outer shape:
   label: "Bear" | "Base" | "Bull",
   key_changes: object,               // assumption deltas; e.g. {"wacc": 0.105, "terminal_g": 0.025}
   implied_px: number,
+  probability: number,               // 0..1, see weighting rule below
+  probability_reasoning: string,     // why this probability for this scenario
   reasoning: string                  // 1 sentence: what world this assumes
 }
 ```
+
+## Weighting rule
+
+The scenario probabilities PLUS the cross-check weight must sum to 1.0.
+
+Example:
+
+```jsonc
+{
+  "scenarios": [
+    {"label": "Bear", "probability": 0.05, ...},
+    {"label": "Base", "probability": 0.55, ...},
+    {"label": "Bull", "probability": 0.20, ...}
+  ],
+  "blending_weights": {
+    "cross_check": 0.20
+  }
+}
+```
+
+Total = 0.05 + 0.55 + 0.20 + 0.20 = 1.00. The blended target is:
+
+```
+target = Σ(scenario.probability × scenario.implied_px) + cross_check_weight × cross_check.outputs.implied_px
+```
+
+A top-level `weights_reasoning` field explains why the LLM chose these particular weights.
 
 ## DCF inputs
 

@@ -366,23 +366,109 @@ def build_sensitivity(wb, valuation):
 
 def build_scenarios(wb, valuation):
     ws = wb.create_sheet("Scenarios")
-    ws["A1"] = "Bear / Base / Bull"
+    ws["A1"] = "Scenarios + probability weights"
     ws["A1"].font = TITLE_FONT
+    ws["A2"] = "Each scenario has its own probability. Final target = sum of (prob x implied px) + cross-check weight x cross-check implied px."
+    ws["A2"].font = SUBTITLE_FONT
+    ws.merge_cells("A2:F2")
 
-    headers = ["Scenario", "Key changes", "Implied px", "Reasoning"]
+    headers = ["Scenario", "Implied px", "Probability", "Weighted contribution", "Probability reasoning", "Scenario narrative"]
     for c, h in enumerate(headers, start=1):
-        cell = ws.cell(row=3, column=c, value=h)
+        cell = ws.cell(row=4, column=c, value=h)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
 
-    for i, scen in enumerate(valuation.get("scenarios", []), start=4):
-        ws.cell(row=i, column=1, value=scen["label"]).font = BODY_BOLD
-        kc = scen.get("key_changes", {})
-        ws.cell(row=i, column=2, value=json.dumps(kc) if isinstance(kc, (dict, list)) else str(kc))
-        ws.cell(row=i, column=3, value=scen.get("implied_px"))
-        ws.cell(row=i, column=4, value=scen.get("reasoning", "")).alignment = Alignment(wrap_text=True, vertical="top")
+    row = 5
+    scenarios = valuation.get("scenarios", [])
+    currency = valuation.get("currency", "USD")
+    for scen in scenarios:
+        ws.cell(row=row, column=1, value=scen["label"]).font = BODY_BOLD
+        ws.cell(row=row, column=2, value=scen.get("implied_px"))
+        prob = scen.get("probability")
+        ws.cell(row=row, column=3, value=prob)
+        if prob is not None and scen.get("implied_px") is not None:
+            ws.cell(row=row, column=4, value=round(prob * scen["implied_px"], 2))
+        ws.cell(row=row, column=5, value=scen.get("probability_reasoning", "")).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=row, column=6, value=scen.get("reasoning", "")).alignment = Alignment(wrap_text=True, vertical="top")
+        # tone fill
+        if scen["label"].lower() == "bull":
+            ws.cell(row=row, column=1).fill = GOOD_FILL
+        elif scen["label"].lower() == "bear":
+            ws.cell(row=row, column=1).fill = BAD_FILL
+        else:
+            ws.cell(row=row, column=1).fill = NEUTRAL_FILL
+        row += 1
+
+    # Cross-check row (if present)
+    cc = valuation.get("cross_check")
+    cc_weight = (valuation.get("blending_weights") or {}).get("cross_check", 0)
+    if cc and cc_weight > 0:
+        ws.cell(row=row, column=1, value=cc.get("name", "Cross-check")).font = BODY_BOLD
+        ws.cell(row=row, column=1).fill = HIGHLIGHT_FILL
+        ws.cell(row=row, column=2, value=cc.get("outputs", {}).get("implied_px"))
+        ws.cell(row=row, column=3, value=cc_weight)
+        cc_px = cc.get("outputs", {}).get("implied_px")
+        if cc_px is not None:
+            ws.cell(row=row, column=4, value=round(cc_weight * cc_px, 2))
+        ws.cell(row=row, column=5, value=cc.get("reasoning", "")).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=row, column=6, value="Peer multiple cross-check (independent of DCF/DDM)").alignment = Alignment(wrap_text=True, vertical="top")
+        row += 1
+
+    # Totals row
+    row += 1
+    ws.cell(row=row, column=1, value="Weight total").font = BODY_BOLD
+    weight_total = valuation.get("weight_total_check")
+    if weight_total is None:
+        weight_total = sum((s.get("probability") or 0) for s in scenarios) + cc_weight
+    ws.cell(row=row, column=3, value=weight_total)
+    if abs(weight_total - 1.0) > 0.001:
+        ws.cell(row=row, column=3).fill = BAD_FILL
+        ws.cell(row=row, column=5, value="WARNING: weights do not sum to 1.0").font = Font(name="Calibri", size=10, bold=True, color="991B1B")
+
+    row += 1
+    ws.cell(row=row, column=1, value="Blended target").font = Font(name="Calibri", size=12, bold=True)
+    ws.cell(row=row, column=4, value=valuation.get("blended_target")).font = Font(name="Calibri", size=12, bold=True)
+    ws.cell(row=row, column=4).fill = HIGHLIGHT_FILL
+
+    row += 1
+    cp = valuation.get("current_price")
+    if cp is not None:
+        ws.cell(row=row, column=1, value="Current price").font = BODY_BOLD
+        ws.cell(row=row, column=4, value=cp)
+        upside = valuation.get("upside_pct")
+        if upside is not None:
+            ws.cell(row=row + 1, column=1, value="Upside / (downside) %").font = BODY_BOLD
+            up_cell = ws.cell(row=row + 1, column=4, value=upside / 100)
+            up_cell.number_format = "0.0%"
+            if upside >= 0:
+                up_cell.fill = GOOD_FILL
+            else:
+                up_cell.fill = BAD_FILL
+
+    # Reasoning panel
+    row += 4
+    ws.cell(row=row, column=1, value="Why these weights?").font = BODY_BOLD
+    ws.cell(row=row, column=1).fill = SECTION_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    row += 1
+    weights_reasoning = valuation.get("weights_reasoning") or valuation.get("blending_logic", "")
+    if weights_reasoning:
+        ws.cell(row=row, column=1, value=weights_reasoning).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+
     autosize(ws)
-    ws.column_dimensions["D"].width = 80
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 13
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 55
+    ws.column_dimensions["F"].width = 55
+
+    # Format probability + weighted columns as numbers / percentages
+    for r in range(5, row + 1):
+        prob_cell = ws.cell(row=r, column=3)
+        if isinstance(prob_cell.value, (int, float)) and 0 <= prob_cell.value <= 1:
+            prob_cell.number_format = "0.0%"
 
 
 def build_peers(wb, narrative):
