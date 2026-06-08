@@ -16,6 +16,120 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def build_fcff_decomposition(year_data: dict) -> dict:
+    """Given a single year's projection inputs, derive the full FCFF build:
+    Revenue -> EBIT -> NOPAT -> D&A -> Capex -> dNWC -> FCFF.
+
+    Backwards compatible: if year_data only carries `fcf_b`, the decomposition
+    fields are returned as None (caller decides how to display).
+    """
+    revenue = year_data.get("revenue_b")
+    ebit_margin = year_data.get("ebit_margin")
+    tax_rate = year_data.get("tax_rate", 0.21)
+    da_pct = year_data.get("da_pct_of_revenue")
+    capex_pct = year_data.get("capex_pct_of_revenue")
+    wc_pct = year_data.get("wc_change_pct_of_revenue")
+
+    if revenue is not None and ebit_margin is not None:
+        ebit = revenue * ebit_margin
+        nopat = ebit * (1 - tax_rate)
+        da = revenue * da_pct if da_pct is not None else None
+        capex = revenue * capex_pct if capex_pct is not None else None
+        wc_change = revenue * wc_pct if wc_pct is not None else None
+        fcff_derived = None
+        if da is not None and capex is not None and wc_change is not None:
+            fcff_derived = nopat + da - capex - wc_change
+        return {
+            "revenue_b": round(revenue, 3),
+            "ebit_margin": ebit_margin,
+            "ebit_b": round(ebit, 3),
+            "tax_rate": tax_rate,
+            "nopat_b": round(nopat, 3),
+            "da_b": round(da, 3) if da is not None else None,
+            "da_pct": da_pct,
+            "capex_b": round(capex, 3) if capex is not None else None,
+            "capex_pct": capex_pct,
+            "wc_change_b": round(wc_change, 3) if wc_change is not None else None,
+            "wc_pct": wc_pct,
+            "fcff_derived_b": round(fcff_derived, 3) if fcff_derived is not None else None,
+            "has_full_build": all(x is not None for x in [da, capex, wc_change]),
+        }
+    return {
+        "revenue_b": revenue,
+        "ebit_margin": ebit_margin,
+        "ebit_b": None,
+        "tax_rate": tax_rate,
+        "nopat_b": None,
+        "da_b": None,
+        "capex_b": None,
+        "wc_change_b": None,
+        "fcff_derived_b": None,
+        "has_full_build": False,
+    }
+
+
+def compute_dual_terminal_value(last_fcf: float, terminal_g: float, wacc: float,
+                                 horizon: int, last_ebitda_b: float = None,
+                                 exit_ev_ebitda: float = None) -> dict:
+    """Compute Gordon Growth TV, Exit-Multiple TV, and Blended TV.
+
+    Returns dict with all three plus PVs and the chosen method.
+    """
+    if wacc <= terminal_g:
+        gordon_tv = float("inf")
+        pv_gordon = float("inf")
+    else:
+        terminal_fcf = last_fcf * (1 + terminal_g)
+        gordon_tv = terminal_fcf / (wacc - terminal_g)
+        pv_gordon = gordon_tv / (1 + wacc) ** horizon
+
+    exit_tv = None
+    pv_exit = None
+    if last_ebitda_b is not None and exit_ev_ebitda is not None:
+        exit_tv = exit_ev_ebitda * last_ebitda_b
+        pv_exit = exit_tv / (1 + wacc) ** horizon
+
+    blended_tv = None
+    pv_blended = None
+    if exit_tv is not None and gordon_tv != float("inf"):
+        blended_tv = 0.5 * gordon_tv + 0.5 * exit_tv
+        pv_blended = blended_tv / (1 + wacc) ** horizon
+
+    return {
+        "gordon": {"tv_b": gordon_tv, "pv_b": pv_gordon},
+        "exit_multiple": {"tv_b": exit_tv, "pv_b": pv_exit, "multiple": exit_ev_ebitda},
+        "blended": {"tv_b": blended_tv, "pv_b": pv_blended},
+    }
+
+
+# Sector WACC bands for adjudication crosscheck (Damodaran-aligned, rounded)
+SECTOR_WACC_BANDS = {
+    "semiconductors": (0.090, 0.120),
+    "software": (0.090, 0.115),
+    "saas": (0.100, 0.130),
+    "ems": (0.080, 0.105),
+    "ipp": (0.065, 0.090),  # independent power producer
+    "utilities": (0.060, 0.080),
+    "industrial": (0.080, 0.105),
+    "miners": (0.100, 0.135),
+    "photonics": (0.090, 0.115),
+    "memory": (0.100, 0.130),
+    "foundry": (0.090, 0.115),
+    "power equipment": (0.080, 0.105),
+}
+
+
+def get_sector_wacc_band(sector_hint: str) -> tuple:
+    """Lookup sector band by case-insensitive substring match. Defaults to (0.08, 0.12)."""
+    if not sector_hint:
+        return (0.08, 0.12)
+    s = sector_hint.lower()
+    for key, band in SECTOR_WACC_BANDS.items():
+        if key in s:
+            return band
+    return (0.08, 0.12)
+
+
 def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float, build_trace: bool = False) -> dict:
     """Run DCF math given fully-specified inputs. Returns outputs dict.
 
@@ -76,6 +190,14 @@ def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float, build_
         ke = rf + beta * erp
         equity_w = 1 - debt_w
 
+        # Full FCFF build per year (if richer inputs provided)
+        fcff_build = []
+        for year_data in fcf_proj:
+            decomp = build_fcff_decomposition(year_data)
+            decomp["year"] = year_data["year"]
+            decomp["fcf_b"] = year_data["fcf_b"]
+            fcff_build.append(decomp)
+
         per_year = []
         for t, year_data in enumerate(fcf_proj, start=1):
             df = 1 / (1 + wacc) ** t
@@ -86,6 +208,36 @@ def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float, build_
                 "discount_factor": round(df, 4),
                 "pv_b": round(pv_y, 3),
             })
+
+        # Dual terminal value if exit multiple provided
+        exit_ev_ebitda = inputs.get("terminal_value", {}).get("exit_ev_ebitda")
+        last_year_data = fcf_proj[-1]
+        last_ebitda_b = None
+        if last_year_data.get("revenue_b") and last_year_data.get("ebit_margin") is not None:
+            # Estimate terminal-year EBITDA = revenue × (ebit_margin + da_pct) if available
+            da_pct = last_year_data.get("da_pct_of_revenue", 0.10)
+            last_ebitda_b = last_year_data["revenue_b"] * (last_year_data["ebit_margin"] + da_pct)
+        dual_tv = compute_dual_terminal_value(last_fcf, terminal_g, wacc, horizon,
+                                              last_ebitda_b=last_ebitda_b,
+                                              exit_ev_ebitda=exit_ev_ebitda)
+
+        # WACC adjudication crosscheck
+        sector_hint = inputs.get("sector_hint") or inputs.get("sector", "")
+        band_lo, band_hi = get_sector_wacc_band(sector_hint)
+        if wacc < band_lo:
+            band_verdict = f"BELOW band ({band_lo*100:.1f}%-{band_hi*100:.1f}%)"
+        elif wacc > band_hi:
+            band_verdict = f"ABOVE band ({band_lo*100:.1f}%-{band_hi*100:.1f}%)"
+        else:
+            band_verdict = f"within band ({band_lo*100:.1f}%-{band_hi*100:.1f}%)"
+        adjudication = {
+            "sector": sector_hint or "(no sector hint)",
+            "sector_band": [band_lo, band_hi],
+            "formula_wacc": wacc,
+            "verdict": band_verdict,
+            "ke": ke,
+            "notes": inputs.get("wacc", {}).get("adjudication_notes", ""),
+        }
 
         trace = {
             "wacc": {
@@ -121,6 +273,18 @@ def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float, build_
             },
         }
         result["calculation_trace"] = trace
+        result["fcff_build"] = fcff_build
+        result["dual_terminal_value"] = {
+            "gordon_tv_b": dual_tv["gordon"]["tv_b"] if dual_tv["gordon"]["tv_b"] != float("inf") else None,
+            "gordon_pv_b": dual_tv["gordon"]["pv_b"] if dual_tv["gordon"]["pv_b"] != float("inf") else None,
+            "exit_multiple_tv_b": dual_tv["exit_multiple"]["tv_b"],
+            "exit_multiple_pv_b": dual_tv["exit_multiple"]["pv_b"],
+            "exit_multiple_x": dual_tv["exit_multiple"]["multiple"],
+            "blended_tv_b": dual_tv["blended"]["tv_b"],
+            "blended_pv_b": dual_tv["blended"]["pv_b"],
+            "terminal_ebitda_b": last_ebitda_b,
+        }
+        result["wacc_adjudication"] = adjudication
 
     return result
 
