@@ -158,8 +158,16 @@ def build_assumptions(wb, valuation):
     if method == "DCF":
         wacc = inputs.get("wacc", {})
         write_input("WACC", wacc.get("value"), wacc.get("reasoning", ""))
-        for k, v in (wacc.get("components") or {}).items():
-            write_input(f"  - {k}", v, "")
+        # Prefer per-component reasoning if available
+        components_reasoned = wacc.get("components_reasoned") or {}
+        if components_reasoned:
+            for k, comp in components_reasoned.items():
+                v = comp.get("value") if isinstance(comp, dict) else comp
+                r = comp.get("reasoning", "") if isinstance(comp, dict) else ""
+                write_input(f"  - {k}", v, r)
+        else:
+            for k, v in (wacc.get("components") or {}).items():
+                write_input(f"  - {k}", v, "")
         tg = inputs.get("terminal_growth", {})
         write_input("Terminal growth", tg.get("value"), tg.get("reasoning", ""))
         write_input("Forecast horizon (yrs)", inputs.get("forecast_horizon_years"), "")
@@ -178,22 +186,24 @@ def build_assumptions(wb, valuation):
             row += 1
 
     elif method == "DDM":
-        for label, key, reasoning_key in [
-            ("Risk-free rate (rf)", "rf", None),
-            ("Equity risk premium (ERP)", "erp", None),
-            ("Beta", "beta", "beta_warning"),
-            ("Sustainable D0", "d0", "d0_method"),
-            ("Book value / share", "book_value_per_share", None),
-            ("ROE", "roe", None),
-            ("g_high (years 1-5)", "g_high", None),
-            ("g_terminal", "g_terminal", None),
-            ("g_book", "g_book", None),
+        # Prefer the explicit *_reasoning fields produced by ddm_compute.
+        for label, key, reasoning_field in [
+            ("Risk-free rate (rf)", "rf", "rf_reasoning"),
+            ("Equity risk premium (ERP)", "erp", "erp_reasoning"),
+            ("Beta", "beta", "beta_reasoning"),
+            ("Sustainable D0", "d0", "d0_reasoning"),
+            ("Book value / share", "book_value_per_share", "book_value_reasoning"),
+            ("ROE", "roe", "roe_reasoning"),
+            ("g_high (years 1-5)", "g_high", "g_high_reasoning"),
+            ("g_terminal", "g_terminal", "g_terminal_reasoning"),
+            ("g_book", "g_book", "g_book_reasoning"),
             ("Years high growth", "years_high", None),
             ("Years declining", "years_decline", None),
             ("Excess returns horizon", "horizon_excess_returns", None),
             ("Max sustainable payout", "max_payout_cap", None),
         ]:
-            write_input(label, inputs.get(key), inputs.get(reasoning_key, "") if reasoning_key else "")
+            reasoning_text = inputs.get(reasoning_field, "") if reasoning_field else ""
+            write_input(label, inputs.get(key), reasoning_text)
 
     elif method == "SOTP":
         ws.cell(row=row, column=1, value="Segments").font = BODY_BOLD
@@ -502,6 +512,99 @@ def build_peers(wb, narrative):
     autosize(ws)
 
 
+def build_formula_trace(wb, valuation):
+    """A tab dedicated to the step-by-step formula derivation of every derived number.
+
+    Trace lives in valuation.primary_method.calculation_trace OR
+    valuation.primary_method.outputs.calculation_trace.
+    """
+    primary = valuation.get("primary_method", {})
+    trace = primary.get("calculation_trace") or primary.get("outputs", {}).get("calculation_trace")
+    if not trace:
+        return
+    ws = wb.create_sheet("Formula trace")
+    ws["A1"] = "Formula trace"
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = "Step-by-step derivation. Same inputs always produce these numbers."
+    ws["A2"].font = SUBTITLE_FONT
+
+    row = 4
+    SECTION_ORDER = [
+        ("wacc", "WACC / Cost of equity"),
+        ("ke", "Cost of equity (Ke)"),
+        ("explicit_fcf", "PV of explicit FCF"),
+        ("ddm", "DDM value"),
+        ("excess_returns", "Excess Returns Model"),
+        ("justified_pb", "Justified P/B"),
+        ("terminal_value", "Terminal value"),
+        ("bridge_to_implied_px", "Bridge to implied price per share"),
+        ("blended", "Blended target"),
+    ]
+    for key, label in SECTION_ORDER:
+        calc = trace.get(key)
+        if not calc:
+            continue
+        # Section title
+        title_cell = ws.cell(row=row, column=1, value=label)
+        title_cell.font = BODY_BOLD
+        title_cell.fill = SECTION_FILL
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        row += 1
+        formula_cell = ws.cell(row=row, column=1, value=f"Formula: {calc.get('formula', '')}")
+        formula_cell.font = Font(name="Calibri", size=10, italic=True, color="6B7280")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        row += 1
+        # Header row
+        ws.cell(row=row, column=1, value="Step").font = HEADER_FONT
+        ws.cell(row=row, column=1).fill = HEADER_FILL
+        ws.cell(row=row, column=2, value="Expression").font = HEADER_FONT
+        ws.cell(row=row, column=2).fill = HEADER_FILL
+        ws.cell(row=row, column=3, value="Result").font = HEADER_FONT
+        ws.cell(row=row, column=3).fill = HEADER_FILL
+        row += 1
+        steps = calc.get("steps") or []
+        for s in steps:
+            ws.cell(row=row, column=1, value=s.get("label", "")).font = BODY_FONT
+            ws.cell(row=row, column=2, value=s.get("expression", "")).font = Font(name="Consolas", size=10)
+            result_cell = ws.cell(row=row, column=3, value=s.get("result", ""))
+            result_cell.font = BODY_BOLD
+            row += 1
+        # Per-year FCF table for explicit_fcf
+        per_year = calc.get("per_year")
+        if per_year:
+            ws.cell(row=row, column=1, value="Year").font = HEADER_FONT
+            ws.cell(row=row, column=1).fill = HEADER_FILL
+            ws.cell(row=row, column=2, value="FCF (bn)").font = HEADER_FONT
+            ws.cell(row=row, column=2).fill = HEADER_FILL
+            ws.cell(row=row, column=3, value="Discount factor").font = HEADER_FONT
+            ws.cell(row=row, column=3).fill = HEADER_FILL
+            ws.cell(row=row, column=4, value="PV (bn)").font = HEADER_FONT
+            ws.cell(row=row, column=4).fill = HEADER_FILL
+            row += 1
+            for y in per_year:
+                ws.cell(row=row, column=1, value=y.get("year"))
+                ws.cell(row=row, column=2, value=y.get("fcf_b"))
+                ws.cell(row=row, column=3, value=y.get("discount_factor"))
+                ws.cell(row=row, column=4, value=y.get("pv_b"))
+                row += 1
+            ws.cell(row=row, column=1, value="Sum (PV explicit FCF)").font = BODY_BOLD
+            ws.cell(row=row, column=4, value=calc.get("result")).font = BODY_BOLD
+            ws.cell(row=row, column=4).fill = HIGHLIGHT_FILL
+            row += 1
+        result_text = calc.get("result")
+        if result_text and not per_year:
+            ws.cell(row=row, column=1, value="Result").font = BODY_BOLD
+            ws.cell(row=row, column=3, value=result_text).font = BODY_BOLD
+            ws.cell(row=row, column=3).fill = HIGHLIGHT_FILL
+            row += 1
+        row += 1  # spacer
+    autosize(ws)
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 45
+    ws.column_dimensions["C"].width = 28
+    ws.column_dimensions["D"].width = 14
+
+
 def build_reasoning_log(wb, narrative, valuation):
     ws = wb.create_sheet("Reasoning Log")
     ws["A1"] = "Reasoning log"
@@ -578,6 +681,7 @@ def main():
     build_cover(wb, narrative, valuation)
     build_assumptions(wb, valuation)
     build_calculation(wb, valuation)
+    build_formula_trace(wb, valuation)
     build_sensitivity(wb, valuation)
     build_scenarios(wb, valuation)
     build_peers(wb, narrative)

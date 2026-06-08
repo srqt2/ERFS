@@ -16,8 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float) -> dict:
-    """Run DCF math given fully-specified inputs. Returns outputs dict."""
+def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float, build_trace: bool = False) -> dict:
+    """Run DCF math given fully-specified inputs. Returns outputs dict.
+
+    If build_trace=True, also returns a `calculation_trace` array of strings
+    that document every step of the derivation. Set to False for sensitivity
+    matrix evaluations (avoid trace pollution).
+    """
     wacc = inputs["wacc"]["value"]
     terminal_g = inputs["terminal_growth"]["value"]
     fcf_proj = inputs["fcf_projections"]
@@ -52,7 +57,7 @@ def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float) -> dic
     implied_equity = implied_ev - net_debt_b
     implied_px = implied_equity / shares_b if shares_b else 0.0
 
-    return {
+    result = {
         "pv_explicit_fcf_b": round(pv_explicit, 3),
         "terminal_value_b": round(tv, 3) if tv != float("inf") else None,
         "pv_terminal_b": round(pv_terminal, 3) if pv_terminal != float("inf") else None,
@@ -60,6 +65,64 @@ def compute_dcf_outputs(inputs: dict, net_debt_b: float, shares_b: float) -> dic
         "implied_equity_b": round(implied_equity, 3) if implied_equity != float("inf") else None,
         "implied_px": round(implied_px, 2) if implied_px != float("inf") else None,
     }
+
+    if build_trace:
+        wacc_components = inputs["wacc"].get("components", {})
+        rf = wacc_components.get("rf", 0)
+        beta = wacc_components.get("beta", 0)
+        erp = wacc_components.get("erp", 0)
+        debt_w = wacc_components.get("debt_weight", 0)
+        kd_at = wacc_components.get("cost_of_debt_after_tax", 0)
+        ke = rf + beta * erp
+        equity_w = 1 - debt_w
+
+        per_year = []
+        for t, year_data in enumerate(fcf_proj, start=1):
+            df = 1 / (1 + wacc) ** t
+            pv_y = year_data["fcf_b"] * df
+            per_year.append({
+                "year": year_data["year"],
+                "fcf_b": round(year_data["fcf_b"], 3),
+                "discount_factor": round(df, 4),
+                "pv_b": round(pv_y, 3),
+            })
+
+        trace = {
+            "wacc": {
+                "formula": "WACC = (1 - D/V) x Ke + (D/V) x Kd_after_tax;  Ke = Rf + Beta x ERP",
+                "steps": [
+                    {"label": "Cost of equity (Ke)", "expression": f"{rf:.4f} + {beta:.3f} x {erp:.4f}", "result": f"{ke:.4f} ({ke*100:.2f}%)"},
+                    {"label": "Equity weight x Ke", "expression": f"{equity_w:.2f} x {ke:.4f}", "result": f"{equity_w*ke:.4f}"},
+                    {"label": "Debt weight x after-tax Kd", "expression": f"{debt_w:.2f} x {kd_at:.4f}", "result": f"{debt_w*kd_at:.4f}"},
+                    {"label": "WACC", "expression": f"{equity_w*ke:.4f} + {debt_w*kd_at:.4f}", "result": f"{wacc:.4f} ({wacc*100:.2f}%)"},
+                ],
+            },
+            "explicit_fcf": {
+                "formula": "PV explicit FCF = sum( FCF_t / (1+WACC)^t ) for t = 1..N",
+                "per_year": per_year,
+                "result": f"{pv_explicit:.3f}B",
+            },
+            "terminal_value": {
+                "formula": "Terminal value = FCF_N x (1 + g_term) / (WACC - g_term);  PV TV = TV / (1+WACC)^N",
+                "steps": [
+                    {"label": "Last projected FCF", "expression": f"FCF_{horizon}", "result": f"{last_fcf:.3f}B"},
+                    {"label": "Terminal FCF", "expression": f"{last_fcf:.3f} x (1 + {terminal_g:.4f})", "result": f"{terminal_fcf:.3f}B"},
+                    {"label": "Terminal value", "expression": f"{terminal_fcf:.3f} / ({wacc:.4f} - {terminal_g:.4f})", "result": f"{tv:.3f}B" if tv != float("inf") else "infinite"},
+                    {"label": "PV of terminal value", "expression": f"{tv:.3f} / (1+{wacc:.4f})^{horizon}" if tv != float("inf") else "n/a", "result": f"{pv_terminal:.3f}B" if pv_terminal != float("inf") else "n/a"},
+                ],
+            },
+            "bridge_to_implied_px": {
+                "formula": "Implied EV = PV explicit FCF + PV terminal;  Equity = EV - Net Debt;  Px = Equity / Shares",
+                "steps": [
+                    {"label": "Implied EV", "expression": f"{pv_explicit:.3f} + {pv_terminal:.3f}" if pv_terminal != float("inf") else "n/a", "result": f"{implied_ev:.3f}B" if implied_ev != float("inf") else "n/a"},
+                    {"label": "Less: net debt", "expression": f"{implied_ev:.3f} - {net_debt_b:.3f}" if implied_ev != float("inf") else "n/a", "result": f"{implied_equity:.3f}B" if implied_equity != float("inf") else "n/a"},
+                    {"label": "Implied price per share", "expression": f"{implied_equity:.3f}B / {shares_b:.3f}B shares" if implied_equity != float("inf") else "n/a", "result": f"${implied_px:.2f}" if implied_px != float("inf") else "n/a"},
+                ],
+            },
+        }
+        result["calculation_trace"] = trace
+
+    return result
 
 
 def compute_sensitivity(inputs: dict, net_debt_b: float, shares_b: float,
@@ -136,8 +199,25 @@ def main():
 
     primary_inputs = primary["inputs"]
 
-    # Base case math
-    base_outputs = compute_dcf_outputs(primary_inputs, net_debt_b, shares_b)
+    # Base case math (with full calculation trace for the primary view)
+    base_outputs = compute_dcf_outputs(primary_inputs, net_debt_b, shares_b, build_trace=True)
+
+    # Auto-attach default reasoning per WACC component if missing
+    wacc_components = primary_inputs.get("wacc", {}).get("components", {})
+    wacc_components_reasoned = {}
+    DEFAULT_COMPONENT_REASONING = {
+        "rf": "Risk-free rate, typically the local 10Y government bond yield. US ~4.4%, EM countries higher.",
+        "beta": "Equity beta vs local index. From yfinance unless sanitized to sector default.",
+        "erp": "Equity risk premium. DM ~5.5%, EM Indonesia ~6.5%, EM India ~6.5%.",
+        "debt_weight": "Debt portion of capital structure. Net debt / (net debt + market cap).",
+        "cost_of_debt_after_tax": "Post-tax cost of debt. Yield on outstanding bonds x (1 - tax rate).",
+    }
+    for k, v in wacc_components.items():
+        wacc_components_reasoned[k] = {
+            "value": v,
+            "reasoning": primary_inputs.get("wacc", {}).get("component_reasonings", {}).get(k, DEFAULT_COMPONENT_REASONING.get(k, "Input from inputs.json")),
+        }
+    primary_inputs.setdefault("wacc", {})["components_reasoned"] = wacc_components_reasoned
 
     # Sensitivity matrix
     wacc_base = primary_inputs["wacc"]["value"]
