@@ -1,37 +1,50 @@
-"""Voice-clean research JSON files in this workspace.
+"""Voice-clean all 9 research JSONs in GER/output/. Removes em-dashes and common AI tells.
 
-Removes em-dashes and common AI tells while preserving numbers and structure.
+After this runs, build_and_deploy.py can safely sync GER -> IntelliDesk without
+re-introducing AI tells.
 
-Usage:
-  python _schema/voice_clean.py                    # cleans all output/*/*.json
-  python _schema/voice_clean.py output/NVDA/NVDA.json    # cleans one file
+This is the MECHANICAL pass (fast, deterministic, regex-based). A deeper
+agent-driven prose rewrite can run separately for final polish.
 """
 
 import json
 import re
-import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DIR = ROOT / "output"
+GER_OUTPUT = Path(r"C:\Users\janua\Downloads\Equity Projects\Global Equity Research\output")
+TICKERS = ["CLS", "AVGO", "NVDA", "COHR", "MU", "GEV", "NOW", "TSM", "VST"]
 
 
 def smart_em_dash(text: str) -> str:
-    """Replace em/en dashes with context-aware punctuation."""
+    """Replace em/en dashes with context-aware punctuation.
+
+    Patterns and choice:
+      ' — '  -> '. '  if next word starts uppercase; else '; '
+      '— '   -> '; '
+      ' —'   -> ';'
+      Numeric ranges 'X — Y' stay readable: '$117 — $474' -> '$117 to $474'
+    """
+    # Numeric range: $123 — $456 (and 117.28 - 474.03 etc.) -> $123 to $456
     text = re.sub(r"(\$?\d[\d,\.]*)\s*[—–]\s*(\$?\d)", r"\1 to \2", text)
 
+    # Standalone " — " between clauses
     def repl(m):
         after = m.group(1)
+        # If next char is uppercase letter, use period + space + that letter
         if after and after[0].isupper():
             return ". " + after
         return "; "
 
     text = re.sub(r"\s*[—–]\s*([A-Za-z])", repl, text)
+
+    # Any leftover em/en dashes get turned into commas
     text = text.replace("—", ",").replace("–", ",")
     return text
 
 
+# Word-level AI tell substitutions. Case-preserving where possible.
 AI_TELLS = [
+    # (pattern, replacement, flags)
     (r"\bdelve into\b", "dig into", re.IGNORECASE),
     (r"\bdelving into\b", "digging into", re.IGNORECASE),
     (r"\btapestry\b", "mix", re.IGNORECASE),
@@ -58,6 +71,7 @@ AI_TELLS = [
     (r"\bgame[- ]changer\b", "step change", re.IGNORECASE),
     (r"\bparadigm shift\b", "regime change", re.IGNORECASE),
     (r"\bsea change\b", "regime change", re.IGNORECASE),
+    # Hedge stacks
     (r"\bcould potentially\b", "could", re.IGNORECASE),
     (r"\blikely could\b", "could", re.IGNORECASE),
     (r"\bmay potentially\b", "may", re.IGNORECASE),
@@ -70,9 +84,11 @@ def fix_text(text):
     out = smart_em_dash(text)
     for pat, repl, flags in AI_TELLS:
         out = re.sub(pat, repl, out, flags=flags)
+    # Cleanup double spaces and stranded commas
     out = re.sub(r"\s+,", ",", out)
     out = re.sub(r",\s*,", ",", out)
     out = re.sub(r" {2,}", " ", out)
+    # If we removed an opener (Moreover,) and left a sentence starting lowercase, capitalize
     out = re.sub(r"(\. )([a-z])", lambda m: m.group(1) + m.group(2).upper(), out)
     return out.strip()
 
@@ -87,29 +103,26 @@ def walk(o):
     return o
 
 
-def clean_file(path: Path):
-    raw = path.read_text(encoding="utf-8")
+total_before, total_after = 0, 0
+for t in TICKERS:
+    src = GER_OUTPUT / t / f"{t}.json"
+    if not src.exists():
+        print(f"!! missing {src}")
+        continue
+    with open(src, encoding="utf-8") as f:
+        raw = f.read()
     em_before = raw.count("—") + raw.count("–")
     data = json.loads(raw)
+
     cleaned = walk(data)
     out_text = json.dumps(cleaned, indent=2, ensure_ascii=False)
     em_after = out_text.count("—") + out_text.count("–")
-    path.write_text(out_text, encoding="utf-8")
-    print(f"  {path.name:20s}  em/en-dashes: {em_before:>3} -> {em_after}")
 
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(out_text)
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        files = [Path(p) for p in sys.argv[1:]]
-    else:
-        files = sorted(DEFAULT_DIR.glob("*/*.json"))
+    total_before += em_before
+    total_after += em_after
+    print(f"  {t:5s}  em/en-dashes: {em_before:>3} -> {em_after}")
 
-    if not files:
-        print(f"No JSON files found under {DEFAULT_DIR}")
-        sys.exit(0)
-
-    for f in files:
-        if not f.exists():
-            print(f"  !! missing: {f}")
-            continue
-        clean_file(f)
+print(f"\nTotal em/en-dashes: {total_before} -> {total_after}")

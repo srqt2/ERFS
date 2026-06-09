@@ -1,20 +1,38 @@
-"""Render a locked-template PDF report from the narrative + valuation JSONs.
+"""Render a locked-template research report PDF from the narrative + valuation JSONs.
 
-Same JSON in -> same PDF out. The agent does not touch PDF layout.
+This produces the LONG-FORM ANALYSIS report (thesis, business overview, catalysts,
+bear case, peers, risks, recommendation) — mirroring exactly what's published on
+the IntelliDesk Vercel page at /research/<category>/<ticker>.
+
+The Excel renderer (render_excel.py) produces the VALUATION MODEL workbook.
+These are two distinct deliverables; this script makes the research report.
+
+Same JSON in → same PDF out. The agent does not touch PDF layout.
 
 Usage:
     python render_pdf.py --ticker AVGO --category AI
        reads:  output/AVGO/AVGO.json + output/AVGO/AVGO_valuation.json
        writes: output/AVGO/AVGO.pdf
 
-Layout (locked sections in order):
-    1. Cover page         - rating banner, key metrics grid, 3-bullet thesis
-    2. Valuation page     - WACC + adjudication + FCFF build + dual TV (or DDM build for banks)
-    3. Scenarios page     - probability-weighted Bear/Base/Bull + blended target
-    4. Bull / bear page   - top catalysts and thesis-breakers
-    5. Peers + cross-check page
-    6. Risks page         - key structural risks
-    7. Methodology page   - assumptions log + data gaps
+Sections (locked order, mirrors Vercel page):
+    1. Header + Recommendation banner
+    2. Thesis (3 bullets)
+    3. Key numbers (snapshot grid)
+    4. Business overview (summary, business model, segments, customers, geographic)
+    5. Historical financials (multi-year P&L table)
+    6. Industry & competitive position (market overview, TAM, moat, competitors)
+    7. Bull catalysts (8-10 numbered cards)
+    8. Bear thesis-breakers (8-10 numbered cards)
+    9. Bear paragraph callout
+    10. Key structural risks (5-7 by category)
+    11. Peers table + read
+    12. Valuation summary (DCF triangulation or DDM/Bank summary)
+    13. Synthesis paths (3 probability-weighted)
+    14. Management & capital allocation
+    15. Social sentiment (if available)
+    16. Recommendation table
+    17. Catalysts to watch
+    18. Data gaps
 """
 
 import argparse
@@ -30,21 +48,24 @@ try:
     from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        PageBreak, KeepTogether, Image
+        PageBreak, KeepTogether
     )
 except ImportError:
     sys.exit("ERROR: reportlab not installed. Run: pip install reportlab")
 
 
 # ============================================================
-# COLORS + STYLES
+# COLOR PALETTE — matches Vercel detail page
 # ============================================================
 
 C_INK = colors.HexColor("#111827")
+C_TEXT = colors.HexColor("#1F2937")
 C_MUTED = colors.HexColor("#6B7280")
 C_LIGHT = colors.HexColor("#F3F4F6")
 C_LIGHTER = colors.HexColor("#FAFAFA")
 C_BORDER = colors.HexColor("#E5E7EB")
+C_BG = colors.HexColor("#F9FAFB")
+
 C_GOOD = colors.HexColor("#166534")
 C_GOOD_BG = colors.HexColor("#DCFCE7")
 C_BAD = colors.HexColor("#991B1B")
@@ -54,48 +75,64 @@ C_NEUTRAL_BG = colors.HexColor("#FEF3C7")
 C_HILITE = colors.HexColor("#DBEAFE")
 C_HEADER = colors.HexColor("#111827")
 
+# Risk category color map
+RISK_COLORS = {
+    "structural": (C_BAD, C_BAD_BG),
+    "cyclical":   (C_NEUTRAL, C_NEUTRAL_BG),
+    "regulatory": (colors.HexColor("#3730A3"), colors.HexColor("#E0E7FF")),
+    "execution":  (colors.HexColor("#9F1239"), colors.HexColor("#FCE7F3")),
+    "customer":   (colors.HexColor("#9A3412"), colors.HexColor("#FED7AA")),
+    "macro":      (colors.HexColor("#155E75"), colors.HexColor("#CFFAFE")),
+}
+
+
+# ============================================================
+# STYLES
+# ============================================================
 
 def get_styles():
-    """Build the locked stylesheet."""
     ss = getSampleStyleSheet()
-
-    styles = {
+    return {
         "title": ParagraphStyle("title", parent=ss["Title"], fontName="Helvetica-Bold",
-                                fontSize=22, leading=26, textColor=C_INK, spaceAfter=2),
+                                fontSize=20, leading=24, textColor=C_INK, spaceAfter=2),
         "subtitle": ParagraphStyle("subtitle", parent=ss["Normal"], fontName="Helvetica",
-                                   fontSize=10, leading=13, textColor=C_MUTED, spaceAfter=8),
-        "h2": ParagraphStyle("h2", parent=ss["Heading2"], fontName="Helvetica-Bold",
-                             fontSize=14, leading=18, textColor=C_INK, spaceBefore=10, spaceAfter=4),
+                                   fontSize=9.5, leading=12, textColor=C_MUTED, spaceAfter=6),
+        "section": ParagraphStyle("section", parent=ss["Heading2"], fontName="Helvetica-Bold",
+                                  fontSize=12, leading=16, textColor=C_INK,
+                                  spaceBefore=10, spaceAfter=2,
+                                  borderPadding=4, borderRadius=4),
+        "section_subtitle": ParagraphStyle("section_subtitle", parent=ss["Normal"], fontName="Helvetica",
+                                           fontSize=9, leading=11, textColor=C_MUTED, spaceAfter=6,
+                                           italic=True),
         "h3": ParagraphStyle("h3", parent=ss["Heading3"], fontName="Helvetica-Bold",
-                             fontSize=11, leading=14, textColor=C_INK, spaceBefore=8, spaceAfter=2,
-                             textTransform="uppercase"),
+                             fontSize=10.5, leading=13, textColor=C_INK,
+                             spaceBefore=6, spaceAfter=2),
         "body": ParagraphStyle("body", parent=ss["Normal"], fontName="Helvetica",
-                               fontSize=10, leading=14, textColor=C_INK),
+                               fontSize=9.5, leading=13, textColor=C_TEXT),
+        "body_justified": ParagraphStyle("body_j", parent=ss["Normal"], fontName="Helvetica",
+                                         fontSize=9.5, leading=13, textColor=C_TEXT,
+                                         alignment=TA_JUSTIFY),
         "body_bold": ParagraphStyle("body_bold", parent=ss["Normal"], fontName="Helvetica-Bold",
-                                    fontSize=10, leading=14, textColor=C_INK),
+                                    fontSize=9.5, leading=13, textColor=C_INK),
         "muted": ParagraphStyle("muted", parent=ss["Normal"], fontName="Helvetica",
-                                fontSize=9, leading=12, textColor=C_MUTED),
+                                fontSize=8.5, leading=11, textColor=C_MUTED),
+        "card_title": ParagraphStyle("card_title", parent=ss["Normal"], fontName="Helvetica-Bold",
+                                     fontSize=10, leading=12, textColor=C_INK, spaceAfter=2),
+        "card_body": ParagraphStyle("card_body", parent=ss["Normal"], fontName="Helvetica",
+                                    fontSize=9, leading=12, textColor=C_TEXT,
+                                    alignment=TA_JUSTIFY),
         "thesis_bullet": ParagraphStyle("thesis_bullet", parent=ss["Normal"], fontName="Helvetica",
-                                        fontSize=10.5, leading=14, textColor=C_INK,
-                                        leftIndent=14, bulletIndent=0, spaceAfter=6),
-        "rating_buy": ParagraphStyle("rating_buy", parent=ss["Normal"], fontName="Helvetica-Bold",
-                                     fontSize=12, leading=14, textColor=C_GOOD, alignment=TA_CENTER),
-        "rating_hold": ParagraphStyle("rating_hold", parent=ss["Normal"], fontName="Helvetica-Bold",
-                                      fontSize=12, leading=14, textColor=C_NEUTRAL, alignment=TA_CENTER),
-        "rating_sell": ParagraphStyle("rating_sell", parent=ss["Normal"], fontName="Helvetica-Bold",
-                                      fontSize=12, leading=14, textColor=C_BAD, alignment=TA_CENTER),
+                                        fontSize=10, leading=14, textColor=C_TEXT,
+                                        leftIndent=12, bulletIndent=0, spaceAfter=4),
+        "rec_action": ParagraphStyle("rec_action", parent=ss["Normal"], fontName="Helvetica-Bold",
+                                     fontSize=13, leading=16, textColor=C_INK, alignment=TA_CENTER),
         "footer": ParagraphStyle("footer", parent=ss["Normal"], fontName="Helvetica",
-                                 fontSize=8, leading=10, textColor=C_MUTED, alignment=TA_CENTER),
+                                 fontSize=7.5, leading=9, textColor=C_MUTED, alignment=TA_CENTER),
     }
-    return styles
 
 
-def rating_style(tone, styles):
-    return {"positive": styles["rating_buy"], "negative": styles["rating_sell"]}.get(tone, styles["rating_hold"])
-
-
-def rating_bg(tone):
-    return {"positive": C_GOOD_BG, "negative": C_BAD_BG}.get(tone, C_NEUTRAL_BG)
+def tone_color(tone):
+    return {"positive": (C_GOOD, C_GOOD_BG), "negative": (C_BAD, C_BAD_BG)}.get(tone, (C_NEUTRAL, C_NEUTRAL_BG))
 
 
 # ============================================================
@@ -104,7 +141,7 @@ def rating_bg(tone):
 
 def fmt_currency(v, currency):
     if v is None:
-        return "n/a"
+        return "—"
     if currency == "IDR":
         return f"IDR {v:,.0f}"
     if abs(v) >= 100:
@@ -112,23 +149,15 @@ def fmt_currency(v, currency):
     return f"${v:,.2f}"
 
 
-def fmt_bn(v, currency="USD"):
-    if v is None:
-        return "n/a"
-    if currency == "IDR":
-        return f"IDR {v:,.1f}T"
-    return f"${v:,.1f}B"
-
-
 def fmt_pct(v, decimals=1):
     if v is None:
-        return "n/a"
-    return f"{v*100:.{decimals}f}%"
+        return "—"
+    return f"{v:.{decimals}f}%"
 
 
-def fmt_signed_pct(v, decimals=1):
+def fmt_signed(v, decimals=1):
     if v is None:
-        return "n/a"
+        return "—"
     return f"{v:+.{decimals}f}%"
 
 
@@ -136,431 +165,423 @@ def fmt_signed_pct(v, decimals=1):
 # HEADER / FOOTER
 # ============================================================
 
-def _draw_header_footer(ticker, name, styles):
+def _draw_header_footer(ticker, name):
     def _h(canvas, doc):
         canvas.saveState()
-        canvas.setFont("Helvetica-Bold", 9)
+        canvas.setFont("Helvetica-Bold", 8.5)
         canvas.setFillColor(C_INK)
-        canvas.drawString(2 * cm, A4[1] - 1.2 * cm, f"{ticker}  —  {name}")
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillColor(C_MUTED)
-        canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.2 * cm, "IntelliDesk · Equity Research")
-        canvas.line(2 * cm, A4[1] - 1.4 * cm, A4[0] - 2 * cm, A4[1] - 1.4 * cm)
-        # Footer
+        canvas.drawString(2 * cm, A4[1] - 1.1 * cm, f"{ticker}  ·  {name}")
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(C_MUTED)
-        canvas.drawString(2 * cm, 1.2 * cm, "Generated by render_pdf.py from JSON. For research only. Not financial advice.")
-        canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc.page}")
+        canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.1 * cm, "IntelliDesk · Equity Research")
+        canvas.setStrokeColor(C_BORDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(2 * cm, A4[1] - 1.3 * cm, A4[0] - 2 * cm, A4[1] - 1.3 * cm)
+        # Footer
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(C_MUTED)
+        canvas.drawString(2 * cm, 1.1 * cm,
+                          "Engine: himself65/finance-skills + custom DCF/DDM + render_pdf.py · For research only · Not financial advice")
+        canvas.drawRightString(A4[0] - 2 * cm, 1.1 * cm, f"Page {doc.page}")
         canvas.restoreState()
     return _h
 
 
 # ============================================================
-# COVER PAGE
+# 1. HEADER + RECOMMENDATION BANNER
 # ============================================================
 
-def build_cover_page(story, narrative, valuation, styles):
+def add_header(story, narrative, valuation, styles):
     ticker = narrative["ticker"]
-    name = narrative["name"]
     rec = narrative.get("recommendation", {})
     currency = valuation.get("currency", "USD")
-    snapshot = {s["label"]: s["value"] for s in narrative.get("snapshot", []) if isinstance(s, dict)}
+    fg, bg = tone_color(rec.get("tone"))
 
-    def snap(prefix, default="n/a"):
-        for k, v in snapshot.items():
-            if k.lower().startswith(prefix.lower()):
-                return v
-        return default
-
-    story.append(Paragraph(f"{name.upper()} ({ticker})", styles["title"]))
+    # Ticker + name title row
     story.append(Paragraph(
-        f"{narrative.get('listings', '')} · {narrative.get('sector', '')} · Date {narrative.get('date', '')}",
+        f"<font color='{C_INK.hexval()}'><b>{ticker}</b></font>  "
+        f"<font color='{C_TEXT.hexval()}'>{narrative.get('name', '')}</font>",
+        styles["title"]
+    ))
+    story.append(Paragraph(
+        f"{narrative.get('listings', '')} · {narrative.get('sector', '')} · "
+        f"Updated <b>{narrative.get('date', '')}</b>",
         styles["subtitle"]
     ))
-    story.append(Spacer(1, 0.3 * cm))
+    story.append(Spacer(1, 0.2 * cm))
 
-    # Rating banner
-    rating_table = Table(
-        [[Paragraph(rec.get("action", ""), rating_style(rec.get("tone"), styles)),
-          Paragraph(
-              f"<b>{fmt_currency(rec.get('current_price'), currency)}</b> spot  "
-              f"<font color=\"#6B7280\">→</font>  "
-              f"<b>{fmt_currency(rec.get('target_12m'), currency)}</b> 12m target  "
-              f"<font color=\"#6B7280\">({rec.get('upside_pct', 0):+.1f}%)</font>",
-              styles["body"]),
-        ]],
-        colWidths=[5 * cm, 11.5 * cm]
-    )
-    rating_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (0, 0), rating_bg(rec.get("tone"))),
-        ("BACKGROUND", (1, 0), (1, 0), C_LIGHTER),
-        ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
-        ("INNERGRID", (0, 0), (-1, -1), 0.5, C_BORDER),
+    # Recommendation banner — 4-cell grid like the Vercel page
+    upside_pct = rec.get("upside_pct", 0)
+    next_earn = rec.get("next_earnings", "—")
+    if len(next_earn) > 50:
+        next_earn = next_earn[:47] + "…"
+    banner_data = [[
+        Paragraph(f"<font color='{fg.hexval()}'><b>RECOMMENDATION</b></font><br/>"
+                  f"<font color='{fg.hexval()}' size='11'><b>{rec.get('action', '')}</b></font>",
+                  styles["body"]),
+        Paragraph(f"<font color='{fg.hexval()}'><b>CURRENT PRICE</b></font><br/>"
+                  f"<font color='{fg.hexval()}' size='11'><b>{fmt_currency(rec.get('current_price'), currency)}</b></font>",
+                  styles["body"]),
+        Paragraph(f"<font color='{fg.hexval()}'><b>12M TARGET</b></font><br/>"
+                  f"<font color='{fg.hexval()}' size='11'><b>{fmt_currency(rec.get('target_12m'), currency)}</b></font>  "
+                  f"<font color='{fg.hexval()}' size='8'>({upside_pct:+.1f}%)</font>",
+                  styles["body"]),
+        Paragraph(f"<font color='{fg.hexval()}'><b>NEXT EARNINGS</b></font><br/>"
+                  f"<font color='{fg.hexval()}' size='9'><b>{next_earn}</b></font>",
+                  styles["body"]),
+    ]]
+    t = Table(banner_data, colWidths=[4 * cm, 4 * cm, 4.5 * cm, 4 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), bg),
+        ("BOX", (0, 0), (-1, -1), 0.5, fg),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 8),
         ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
     ]))
-    story.append(rating_table)
-    story.append(Spacer(1, 0.5 * cm))
+    story.append(t)
+    story.append(Spacer(1, 0.3 * cm))
 
-    # Key metrics grid (4 columns)
-    primary = valuation.get("primary_method", {})
-    primary_outputs = primary.get("outputs", {})
 
-    rows = [
-        ("Market cap", snap("market cap"), "Enterprise value", snap("enterprise")),
-        ("FY revenue", snap("FY") or snap("revenue"), "FY EBITDA / margin", snap("EBITDA")),
-        ("FY FCF", snap("FCF"), "Net debt", snap("Net debt")),
-        ("Forward EPS", snap("Forward EPS"), "Forward P/E", snap("Forward P/E")),
-        ("EV/EBITDA", snap("EV"), "Beta", snap("Beta")),
-        ("ADTV (30d)", snap("ADTV"), "30d vol", snap("30d")),
-        ("Analyst consensus", snap("consensus"), "Mean PT", snap("Mean") or snap("median")),
-    ]
-    if primary.get("name") == "DCF":
-        comps = primary.get("inputs", {}).get("wacc", {}).get("components", {})
-        wacc_value = primary.get("inputs", {}).get("wacc", {}).get("value")
-        ke_value = comps.get("rf", 0) + comps.get("beta", 0) * comps.get("erp", 0)
-        rows.append(("WACC", fmt_pct(wacc_value, 2), "Ke (CAPM)", fmt_pct(ke_value, 2)))
-        rows.append(("DCF Base implied", fmt_currency(primary_outputs.get("implied_px"), currency),
-                     "Math blended target", fmt_currency(valuation.get("blended_target"), currency)))
-    elif primary.get("name") == "DDM":
-        ke = primary_outputs.get("cost_of_equity_pct")
-        ddm_val = primary_outputs.get("ddm", {}).get("implied_value")
-        rows.append(("Cost of equity (Ke)", f"{ke:.2f}%" if ke is not None else "n/a",
-                     "Method", "DDM"))
-        rows.append(("DDM implied", fmt_currency(ddm_val, currency),
-                     "Math blended target", fmt_currency(valuation.get("blended_target"), currency)))
+# ============================================================
+# 2. THESIS
+# ============================================================
 
-    # Build the metrics table
-    table_data = []
-    for r in rows:
-        table_data.append([
-            Paragraph(f"<b>{r[0]}</b>", styles["body"]),
-            Paragraph(str(r[1]), styles["body"]),
-            Paragraph(f"<b>{r[2]}</b>", styles["body"]),
-            Paragraph(str(r[3]), styles["body"]),
+def add_thesis(story, narrative, styles):
+    if not narrative.get("thesis"):
+        return
+    _section(story, "Thesis", "Three bullets — the whole bet", styles)
+    for i, t in enumerate(narrative["thesis"], start=1):
+        story.append(Paragraph(f"<b>{i}.</b>  {t}", styles["thesis_bullet"]))
+    story.append(Spacer(1, 0.3 * cm))
+
+
+# ============================================================
+# 3. KEY NUMBERS (snapshot grid)
+# ============================================================
+
+def add_key_numbers(story, narrative, styles):
+    snapshot = narrative.get("snapshot") or []
+    if not snapshot:
+        return
+    _section(story, "Key numbers", "Pulled via yfinance-data · validated by Delta audit", styles)
+
+    # Build a 3-col grid of (label / value) cells
+    cells = []
+    for s in snapshot:
+        if isinstance(s, dict):
+            cells.append(s.get("label", ""))
+            cells.append(s.get("value", ""))
+
+    # Group into rows of 6 columns (3 label-value pairs per row)
+    rows = []
+    n_per_row = 6  # 3 pairs of (label, value)
+    current_row = []
+    for i in range(0, len(cells), 2):
+        label = cells[i] if i < len(cells) else ""
+        value = cells[i + 1] if i + 1 < len(cells) else ""
+        current_row.extend([
+            Paragraph(f"<font color='{C_MUTED.hexval()}' size='7'>{label.upper()}</font>", styles["body"]),
+            Paragraph(f"<b>{value}</b>", styles["body"]),
         ])
-    metrics_table = Table(table_data, colWidths=[3.6 * cm, 4.7 * cm, 3.6 * cm, 4.7 * cm])
-    metrics_table.setStyle(TableStyle([
-        ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
-        ("INNERGRID", (0, 0), (-1, -1), 0.5, C_BORDER),
-        ("BACKGROUND", (0, 0), (0, -1), C_LIGHTER),
-        ("BACKGROUND", (2, 0), (2, -1), C_LIGHTER),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    story.append(metrics_table)
-    story.append(Spacer(1, 0.4 * cm))
+        if len(current_row) >= n_per_row:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        # Pad
+        while len(current_row) < n_per_row:
+            current_row.append(Paragraph("", styles["body"]))
+        rows.append(current_row)
 
-    # Thesis
-    story.append(Paragraph("THREE-LINE THESIS", styles["h3"]))
-    for t in narrative.get("thesis", []):
-        story.append(Paragraph(f"• {t}", styles["thesis_bullet"]))
-
-    story.append(Spacer(1, 0.3 * cm))
-    story.append(Paragraph(
-        f"<i>Research cycle: equity-bull-case skill → equity-bear-case skill (independent) → "
-        f"synthesis → {primary.get('name', 'valuation')} compute → render Excel + PDF</i>",
-        styles["muted"]
-    ))
-
-
-# ============================================================
-# VALUATION PAGE
-# ============================================================
-
-def build_valuation_page(story, narrative, valuation, styles):
-    story.append(PageBreak())
-    primary = valuation.get("primary_method", {})
-    method = primary.get("name", "")
-    currency = valuation.get("currency", "USD")
-    outputs = primary.get("outputs", {})
-    inputs = primary.get("inputs", {})
-
-    story.append(Paragraph(f"VALUATION — {method}", styles["h2"]))
-    story.append(Paragraph(
-        f"Method reasoning: {primary.get('reasoning', '')}",
-        styles["body"]
-    ))
-    story.append(Spacer(1, 0.3 * cm))
-
-    if method == "DCF":
-        # WACC summary
-        story.append(Paragraph("WACC INPUTS & ADJUDICATION", styles["h3"]))
-        comps = inputs.get("wacc", {}).get("components", {})
-        rf = comps.get("rf", 0)
-        beta = comps.get("beta", 0)
-        erp = comps.get("erp", 0)
-        debt_w = comps.get("debt_weight", 0)
-        kd_at = comps.get("cost_of_debt_after_tax", 0)
-        ke = rf + beta * erp
-        wacc_value = inputs.get("wacc", {}).get("value", 0)
-
-        wacc_data = [
-            ["Input", "Source", "Value"],
-            ["Rf (risk-free rate)", "10Y government bond", fmt_pct(rf, 2)],
-            ["Beta", "yfinance / input", f"{beta:.3f}"],
-            ["ERP", "Damodaran DM/EM", fmt_pct(erp, 2)],
-            ["Ke = Rf + Beta × ERP", "CAPM", fmt_pct(ke, 2)],
-            ["Debt weight (D/V)", "input", fmt_pct(debt_w, 1)],
-            ["Equity weight (E/V)", "1 - D/V", fmt_pct(1 - debt_w, 1)],
-            ["Kd (after-tax)", "input", fmt_pct(kd_at, 2)],
-            ["Formula WACC", "(E/V × Ke) + (D/V × Kd)", fmt_pct(wacc_value, 2)],
-        ]
-        wacc_table = Table(wacc_data, colWidths=[5.5 * cm, 6 * cm, 4 * cm])
-        wacc_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
+    if rows:
+        col_w = 16.5 / 6 * cm
+        t = Table(rows, colWidths=[col_w] * 6)
+        t.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
             ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
-            ("BACKGROUND", (0, -1), (-1, -1), C_HILITE),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]))
-        story.append(wacc_table)
-        story.append(Spacer(1, 0.3 * cm))
+        story.append(t)
+    story.append(Spacer(1, 0.3 * cm))
 
-        # Adjudication crosscheck
-        adj = outputs.get("wacc_adjudication") or {}
-        if adj:
-            band = adj.get("sector_band", [0, 0])
-            verdict = adj.get("verdict", "")
-            verdict_color = C_NEUTRAL_BG if ("ABOVE" in verdict.upper() or "BELOW" in verdict.upper()) else C_GOOD_BG
-            adj_data = [
-                [Paragraph("<b>Sector band</b>", styles["body"]),
-                 Paragraph(f"{adj.get('sector', 'default')}: {band[0]*100:.1f}% − {band[1]*100:.1f}%", styles["body"])],
-                [Paragraph("<b>Verdict</b>", styles["body"]),
-                 Paragraph(f"<b>{fmt_pct(wacc_value, 2)}</b> — {verdict}", styles["body"])],
-            ]
-            adj_table = Table(adj_data, colWidths=[3.5 * cm, 12 * cm])
-            adj_table.setStyle(TableStyle([
-                ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
+
+# ============================================================
+# 4. BUSINESS OVERVIEW
+# ============================================================
+
+def add_business_overview(story, narrative, styles):
+    bo = narrative.get("business_overview")
+    if not bo:
+        return
+    _section(story, "Business overview", "What the company does, how it makes money, who it sells to", styles)
+
+    if bo.get("summary"):
+        story.append(Paragraph(bo["summary"], styles["body_justified"]))
+        story.append(Spacer(1, 0.15 * cm))
+
+    if bo.get("business_model"):
+        _key_callout(story, "BUSINESS MODEL", bo["business_model"], styles)
+        story.append(Spacer(1, 0.15 * cm))
+
+    # Segments
+    if bo.get("segments"):
+        story.append(Paragraph("SEGMENTS", styles["h3"]))
+        for seg in bo["segments"]:
+            metrics_parts = []
+            if seg.get("revenue_share_pct") is not None:
+                metrics_parts.append(f"<font color='{C_MUTED.hexval()}'>rev</font> <b>{seg['revenue_share_pct']:.0f}%</b>")
+            if seg.get("growth_yoy_pct") is not None:
+                gc = C_GOOD if seg["growth_yoy_pct"] >= 0 else C_BAD
+                metrics_parts.append(f"<font color='{gc.hexval()}'><b>{seg['growth_yoy_pct']:+.0f}% YoY</b></font>")
+            if seg.get("margin_pct") is not None:
+                metrics_parts.append(f"<font color='{C_MUTED.hexval()}'>mgn</font> <b>{seg['margin_pct']:.1f}%</b>")
+            metrics = "  ·  ".join(metrics_parts)
+            head = f"<b>{seg.get('name', '')}</b>" + (f"     {metrics}" if metrics else "")
+            story.append(Paragraph(head, styles["body"]))
+            if seg.get("description"):
+                story.append(Paragraph(seg["description"], styles["card_body"]))
+            story.append(Spacer(1, 0.1 * cm))
+
+    # Customers
+    if bo.get("customers"):
+        story.append(Paragraph("TOP CUSTOMERS", styles["h3"]))
+        rows = []
+        for c in bo["customers"][:8]:
+            share = f"<b>{c.get('revenue_share_pct'):.0f}%</b>" if c.get("revenue_share_pct") is not None else ""
+            rows.append([
+                Paragraph(f"<b>{c.get('name', '')}</b>", styles["body"]),
+                Paragraph(share, styles["body"]),
+                Paragraph(c.get("importance", ""), styles["card_body"]),
+            ])
+        if rows:
+            t = Table(rows, colWidths=[5 * cm, 1.5 * cm, 10 * cm])
+            t.setStyle(TableStyle([
+                ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
                 ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
-                ("BACKGROUND", (0, 0), (0, -1), C_LIGHTER),
-                ("BACKGROUND", (1, -1), (1, -1), verdict_color),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                 ("TOPPADDING", (0, 0), (-1, -1), 4),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]))
-            story.append(adj_table)
-            story.append(Spacer(1, 0.4 * cm))
+            story.append(t)
 
-        # FCFF build
-        fcff_build = outputs.get("fcff_build") or []
-        if fcff_build and any(f.get("has_full_build") for f in fcff_build):
-            story.append(Paragraph("FCFF BUILD (5-7 year explicit period)", styles["h3"]))
-            years = [str(f.get("year", "")) for f in fcff_build]
-            # Build pivot rows: metric x years
-            metric_rows = [
-                ("Revenue (B)", "revenue_b", None),
-                ("EBIT margin", "ebit_margin", "pct"),
-                ("EBIT (B)", "ebit_b", None),
-                ("NOPAT (B)", "nopat_b", None),
-                ("D&A (B)", "da_b", None),
-                ("Capex (B)", "capex_b", None),
-                ("dNWC (B)", "wc_change_b", None),
-                ("FCFF (B)", "fcf_b", None),
-            ]
-            trace = outputs.get("calculation_trace", {})
-            per_year = trace.get("explicit_fcf", {}).get("per_year", [])
-            fcff_data = [["Item"] + years]
-            for label, key, fmt in metric_rows:
-                row = [label]
-                for fb in fcff_build:
-                    v = fb.get(key)
-                    if v is None:
-                        row.append("—")
-                    elif fmt == "pct":
-                        row.append(fmt_pct(v))
-                    elif isinstance(v, float):
-                        row.append(f"{v:,.1f}")
-                    else:
-                        row.append(str(v))
-                fcff_data.append(row)
-            if per_year:
-                pv_row = ["PV (B)"] + [f"{py.get('pv_b', 0):,.1f}" for py in per_year]
-                fcff_data.append(pv_row)
+    # Geographic
+    if bo.get("geographic_revenue"):
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph("GEOGRAPHIC REVENUE", styles["h3"]))
+        chips = "  ".join([
+            f"<b>{g.get('region', '')}</b> <font color='{C_MUTED.hexval()}'>{g.get('pct', 0):.0f}%</font>"
+            for g in bo["geographic_revenue"]
+        ])
+        story.append(Paragraph(chips, styles["body"]))
+    story.append(Spacer(1, 0.3 * cm))
 
-            n_years = len(years)
-            col_widths = [3.2 * cm] + [(15.5 - 3.2) / n_years * cm] * n_years
-            fcff_table = Table(fcff_data, colWidths=col_widths)
-            fcff_table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
-                ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
-                ("BACKGROUND", (0, -1), (-1, -1), C_HILITE),
-                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-                ("BACKGROUND", (0, -2), (-1, -2), C_LIGHTER),  # FCFF row
-                ("FONTNAME", (0, -2), (-1, -2), "Helvetica-Bold"),
-                ("BACKGROUND", (0, 1), (0, -1), C_LIGHTER),
-                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
-                ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]))
-            story.append(fcff_table)
-            story.append(Spacer(1, 0.4 * cm))
 
-        # Terminal value & EV bridge
-        story.append(Paragraph("TERMINAL VALUE & EV BRIDGE", styles["h3"]))
-        dual_tv = outputs.get("dual_terminal_value") or {}
-        tv_data = [
-            ["Component", "Value (B)"],
-            ["Terminal growth (g)", fmt_pct(inputs.get("terminal_growth", {}).get("value"), 2)],
-            ["TV — Gordon Growth", f"{dual_tv.get('gordon_tv_b', 0):,.1f}" if dual_tv.get("gordon_tv_b") else "n/a"],
-        ]
-        if dual_tv.get("exit_multiple_tv_b") is not None:
-            tv_data.append([f"TV — Exit Multiple ({dual_tv.get('exit_multiple_x')}× EBITDA)",
-                            f"{dual_tv.get('exit_multiple_tv_b', 0):,.1f}"])
-            tv_data.append(["TV — Blended (50/50)", f"{dual_tv.get('blended_tv_b', 0):,.1f}"])
-        tv_data += [
-            ["PV of TV (Gordon)", f"{dual_tv.get('gordon_pv_b', 0):,.1f}" if dual_tv.get("gordon_pv_b") else "n/a"],
-            ["Sum of PV of explicit FCFF", f"{outputs.get('pv_explicit_fcf_b', 0):,.1f}"],
-            ["Implied EV", f"{outputs.get('implied_ev_b', 0):,.1f}"],
-            ["(less) Net debt", f"{valuation.get('net_debt_b', 0):,.1f}"],
-            ["Implied equity value", f"{outputs.get('implied_equity_b', 0):,.1f}"],
-            ["Diluted shares (B)", f"{valuation.get('shares_outstanding_b', 0):,.2f}"],
-            ["IMPLIED PRICE / SHARE", fmt_currency(outputs.get("implied_px"), currency)],
-        ]
-        tv_table = Table(tv_data, colWidths=[10 * cm, 5.5 * cm])
-        tv_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
+# ============================================================
+# 5. HISTORICAL FINANCIALS
+# ============================================================
+
+def add_historical_financials(story, narrative, styles):
+    hist = narrative.get("historical_financials") or []
+    if not hist:
+        return
+    _section(story, "Historical financials", "P&L trajectory — revenue, EBITDA, FCF, EPS", styles)
+
+    rows = [["FY", "Revenue ($B)", "Growth", "Gross mgn", "EBITDA ($M)", "EBITDA mgn", "Net inc ($M)", "FCF ($M)", "EPS"]]
+    for h in hist:
+        def num(k, fmt="{:,.0f}"):
+            v = h.get(k)
+            return "—" if v is None else fmt.format(v)
+        rows.append([
+            h.get("fy", ""),
+            num("revenue_usd_b", "{:,.2f}"),
+            fmt_signed(h.get("revenue_growth_yoy_pct")) if h.get("revenue_growth_yoy_pct") is not None else "—",
+            fmt_pct(h.get("gross_margin_pct")) if h.get("gross_margin_pct") is not None else "—",
+            num("ebitda_usd_m"),
+            fmt_pct(h.get("ebitda_margin_pct")) if h.get("ebitda_margin_pct") is not None else "—",
+            num("net_income_usd_m"),
+            num("fcf_usd_m"),
+            num("eps", "${:,.2f}"),
+        ])
+    col_widths = [1.4 * cm, 1.9 * cm, 1.4 * cm, 1.6 * cm, 1.9 * cm, 1.7 * cm, 1.9 * cm, 1.6 * cm, 1.4 * cm]
+    t = Table(rows, colWidths=col_widths)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 0.3 * cm))
+
+
+# ============================================================
+# 6. INDUSTRY & COMPETITIVE POSITION
+# ============================================================
+
+def add_industry_position(story, narrative, styles):
+    ip = narrative.get("industry_position")
+    if not ip:
+        return
+    _section(story, "Industry & competitive position", "Where the company sits · moat · competitors", styles)
+
+    if ip.get("market_overview"):
+        story.append(Paragraph(ip["market_overview"], styles["body_justified"]))
+        story.append(Spacer(1, 0.15 * cm))
+
+    if ip.get("tam_usd_bn"):
+        story.append(Paragraph(
+            f"<font color='{colors.HexColor('#3730A3').hexval()}'><b>TAM: ${ip['tam_usd_bn']}B</b></font>",
+            styles["body"]
+        ))
+        story.append(Spacer(1, 0.1 * cm))
+
+    if ip.get("moat"):
+        _key_callout(story, "MOAT", ip["moat"], styles, color=C_GOOD, bg=C_GOOD_BG)
+        story.append(Spacer(1, 0.15 * cm))
+
+    if ip.get("competitors"):
+        story.append(Paragraph("COMPETITORS", styles["h3"]))
+        rows = []
+        for c in ip["competitors"]:
+            rows.append([
+                Paragraph(f"<b>{c.get('name', '')}</b>", styles["body"]),
+                Paragraph(c.get("description", ""), styles["card_body"]),
+            ])
+        t = Table(rows, colWidths=[3 * cm, 13.5 * cm])
+        t.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
             ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
-            ("BACKGROUND", (0, -1), (-1, -1), C_HILITE),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-            ("BACKGROUND", (0, -3), (-1, -3), C_LIGHTER),
-            ("FONTNAME", (0, -3), (-1, -3), "Helvetica-Bold"),
-            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
-        story.append(tv_table)
-
-    elif method == "DDM":
-        outputs_ddm = outputs.get("ddm", {})
-        outputs_er = outputs.get("excess_returns", {})
-        outputs_jpb = outputs.get("justified_pb", {})
-        ddm_data = [
-            ["Component", "Implied value"],
-            ["Cost of equity (Ke)", fmt_pct(outputs.get("cost_of_equity_pct", 0) / 100, 2)],
-            ["DDM implied", fmt_currency(outputs_ddm.get("implied_value"), currency)],
-            ["Excess Returns implied", fmt_currency(outputs_er.get("implied_value"), currency)],
-            ["Justified P/B implied", fmt_currency(outputs_jpb.get("implied_value"), currency)],
-            ["Blended (40/40/20)", fmt_currency(outputs.get("implied_px"), currency)],
-        ]
-        ddm_table = Table(ddm_data, colWidths=[10 * cm, 5.5 * cm])
-        ddm_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
-            ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
-            ("BACKGROUND", (0, -1), (-1, -1), C_HILITE),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]))
-        story.append(ddm_table)
-
-
-# ============================================================
-# SCENARIOS PAGE
-# ============================================================
-
-def build_scenarios_page(story, narrative, valuation, styles):
-    story.append(PageBreak())
-    currency = valuation.get("currency", "USD")
-    story.append(Paragraph("SCENARIOS & PROBABILITY WEIGHTS", styles["h2"]))
-    story.append(Paragraph(
-        "Final target = Σ(scenario.prob × scenario.implied_px) + cross_check.weight × cross_check.implied_px",
-        styles["muted"]
-    ))
+        story.append(t)
     story.append(Spacer(1, 0.3 * cm))
 
-    scenarios = valuation.get("scenarios", [])
-    cc = valuation.get("cross_check")
-    cc_weight = (valuation.get("blending_weights") or {}).get("cross_check", 0)
 
-    # Table header
-    rows = [["Scenario", "Implied px", "Prob.", "Contribution"]]
-    body_rows_styles = []
-    row_idx = 1
-    for scen in scenarios:
-        prob = scen.get("probability")
-        contrib = round(prob * scen["implied_px"], 2) if (prob and scen.get("implied_px")) else None
+# ============================================================
+# 7. BULL CATALYSTS
+# ============================================================
+
+def add_bull_catalysts(story, narrative, styles):
+    catalysts = narrative.get("bull_catalysts") or []
+    if not catalysts:
+        return
+    _section(story, "Bull catalysts", "What needs to happen for the long thesis to play out", styles)
+    for c in catalysts:
+        _numbered_card(story, c, styles, color=C_GOOD, bg=C_GOOD_BG)
+    story.append(Spacer(1, 0.2 * cm))
+
+
+# ============================================================
+# 8. BEAR THESIS-BREAKERS
+# ============================================================
+
+def add_bear_breakers(story, narrative, styles):
+    breakers = narrative.get("bear_breakers") or []
+    if not breakers:
+        return
+    _section(story, "Bear thesis-breakers",
+             "Independent bear lane · not visible to the bull author until synthesis",
+             styles)
+    for c in breakers:
+        _numbered_card(story, c, styles, color=C_BAD, bg=C_BAD_BG)
+    story.append(Spacer(1, 0.2 * cm))
+
+    bp = narrative.get("bear_paragraph")
+    if bp:
+        story.append(Paragraph(
+            "<b><font color='#991B1B'>BEAR CASE IN ONE PARAGRAPH</font></b>",
+            styles["h3"]
+        ))
+        story.append(_callout_paragraph(bp, styles, color=C_BAD, bg=colors.HexColor("#FEF2F2")))
+    story.append(Spacer(1, 0.3 * cm))
+
+
+# ============================================================
+# 9. KEY STRUCTURAL RISKS
+# ============================================================
+
+def add_key_risks(story, narrative, styles):
+    risks = narrative.get("key_risks") or []
+    if not risks:
+        return
+    _section(story, "Key structural risks",
+             "Risks orthogonal to the bear thesis · what breaks the long term, not just the next print",
+             styles)
+    for r in risks:
+        cat = (r.get("category") or "structural").lower()
+        fg, bg = RISK_COLORS.get(cat, (C_INK, C_LIGHT))
+        head_table = Table(
+            [[Paragraph(f"<font color='{fg.hexval()}'><b>{cat.upper()}</b></font>", styles["body"]),
+              Paragraph(f"<b>{r.get('title', '')}</b>", styles["body"])]],
+            colWidths=[2.5 * cm, 14 * cm]
+        )
+        head_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), bg),
+            ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(head_table)
+        if r.get("description"):
+            story.append(Paragraph(r["description"], styles["card_body"]))
+        story.append(Spacer(1, 0.15 * cm))
+    story.append(Spacer(1, 0.2 * cm))
+
+
+# ============================================================
+# 10. PEERS
+# ============================================================
+
+def add_peers(story, narrative, styles):
+    peers = narrative.get("peers") or []
+    if not peers:
+        return
+    _section(story, "Peers",
+             "NTM P/E, EV/EBITDA, growth, and YTD / 1Y returns across the peer set",
+             styles)
+
+    rows = [["Ticker", "NTM P/E", "EV/EBITDA", "Rev growth", "YTD", "1Y"]]
+    highlight_rows = []
+    for p in peers:
         rows.append([
-            scen["label"],
-            fmt_currency(scen.get("implied_px"), currency),
-            fmt_pct(prob, 1) if prob is not None else "—",
-            fmt_currency(contrib, currency) if contrib is not None else "—",
+            p["ticker"],
+            f"{p.get('pe_ntm', 0):.1f}x" if p.get("pe_ntm") is not None else "—",
+            f"{p.get('ev_ebitda', 0):.1f}x" if p.get("ev_ebitda") is not None else "—",
+            fmt_signed(p.get("rev_growth_ttm")) if p.get("rev_growth_ttm") is not None else "—",
+            fmt_signed(p.get("ytd")) if p.get("ytd") is not None else "—",
+            fmt_signed(p.get("y1")) if p.get("y1") is not None else "—",
         ])
-        if scen["label"].lower() == "bull":
-            body_rows_styles.append(("BACKGROUND", (0, row_idx), (0, row_idx), C_GOOD_BG))
-        elif scen["label"].lower() == "bear":
-            body_rows_styles.append(("BACKGROUND", (0, row_idx), (0, row_idx), C_BAD_BG))
-        else:
-            body_rows_styles.append(("BACKGROUND", (0, row_idx), (0, row_idx), C_NEUTRAL_BG))
-        row_idx += 1
-    if cc and cc_weight > 0:
-        cc_px = cc.get("outputs", {}).get("implied_px")
-        contrib = round(cc_weight * cc_px, 2) if cc_px else None
-        rows.append([
-            cc.get("name", "Cross-check"),
-            fmt_currency(cc_px, currency),
-            fmt_pct(cc_weight, 1),
-            fmt_currency(contrib, currency) if contrib is not None else "—",
-        ])
-        body_rows_styles.append(("BACKGROUND", (0, row_idx), (0, row_idx), C_HILITE))
-        row_idx += 1
+        if p.get("highlight"):
+            highlight_rows.append(len(rows) - 1)
 
-    # Weight total + blended target
-    weight_total = valuation.get("weight_total_check") or (
-        sum((s.get("probability") or 0) for s in scenarios) + cc_weight)
-    rows.append(["WEIGHT TOTAL", "", fmt_pct(weight_total, 1), ""])
-    rows.append(["BLENDED TARGET", "", "", fmt_currency(valuation.get("blended_target"), currency)])
-    cp = valuation.get("current_price")
-    upside = valuation.get("upside_pct")
-    if cp:
-        rows.append(["Current price", fmt_currency(cp, currency), "", ""])
-        if upside is not None:
-            rows.append(["Upside vs spot", "", "", fmt_signed_pct(upside)])
-
-    scen_table = Table(rows, colWidths=[5 * cm, 3.5 * cm, 2.5 * cm, 4.5 * cm])
+    t = Table(rows, colWidths=[2.5 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm])
     base_style = [
         ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
         ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
         ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
         ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
@@ -570,193 +591,389 @@ def build_scenarios_page(story, narrative, valuation, styles):
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]
-    base_style += body_rows_styles
-    # Highlight blended target row
-    blended_row = len(rows) - (3 if cp else 1)
-    base_style.append(("BACKGROUND", (0, blended_row), (-1, blended_row), C_HILITE))
-    base_style.append(("FONTNAME", (0, blended_row), (-1, blended_row), "Helvetica-Bold"))
-    scen_table.setStyle(TableStyle(base_style))
-    story.append(scen_table)
-    story.append(Spacer(1, 0.4 * cm))
+    for hr in highlight_rows:
+        base_style.append(("BACKGROUND", (0, hr), (-1, hr), C_HILITE))
+        base_style.append(("FONTNAME", (0, hr), (-1, hr), "Helvetica-Bold"))
+    t.setStyle(TableStyle(base_style))
+    story.append(t)
 
-    # Why these weights
-    weights_reasoning = valuation.get("weights_reasoning") or valuation.get("blending_logic", "")
-    if weights_reasoning:
-        story.append(Paragraph("WHY THESE WEIGHTS?", styles["h3"]))
-        story.append(Paragraph(weights_reasoning, styles["body"]))
-
-
-# ============================================================
-# BULL / BEAR PAGE
-# ============================================================
-
-def build_bull_bear_page(story, narrative, styles):
-    story.append(PageBreak())
-    story.append(Paragraph("BULL CASE", styles["h2"]))
-    for c in narrative.get("bull_catalysts", [])[:6]:
-        story.append(Paragraph(f"<b>{c.get('id', '')}. {c.get('title', '')}</b>", styles["body_bold"]))
-        story.append(Paragraph(c.get("body", ""), styles["body"]))
-        story.append(Spacer(1, 0.2 * cm))
-
+    if narrative.get("peers_read"):
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph(
+            f"<font color='{C_MUTED.hexval()}'><b>Read:</b></font> {narrative['peers_read']}",
+            styles["body"]
+        ))
     story.append(Spacer(1, 0.3 * cm))
-    story.append(Paragraph("BEAR CASE", styles["h2"]))
-    for c in narrative.get("bear_breakers", [])[:6]:
-        story.append(Paragraph(f"<b>{c.get('id', '')}. {c.get('title', '')}</b>", styles["body_bold"]))
-        story.append(Paragraph(c.get("body", ""), styles["body"]))
-        story.append(Spacer(1, 0.2 * cm))
-
-    if narrative.get("bear_paragraph"):
-        story.append(Spacer(1, 0.2 * cm))
-        story.append(Paragraph("ONE-PARAGRAPH BEAR", styles["h3"]))
-        story.append(Paragraph(narrative["bear_paragraph"], styles["body"]))
 
 
 # ============================================================
-# PEERS PAGE
+# 11. VALUATION SUMMARY (DCF triangulation or DDM)
 # ============================================================
 
-def build_peers_page(story, narrative, valuation, styles):
-    story.append(PageBreak())
-    story.append(Paragraph("PEER COMPARABLES & CROSS-CHECK", styles["h2"]))
-    peers = narrative.get("peers", [])
-    if peers:
-        rows = [["Ticker", "NTM P/E", "EV/EBITDA", "Rev Growth", "YTD", "1Y"]]
-        highlight_rows = []
-        for p in peers:
+def add_valuation_summary(story, narrative, valuation, styles):
+    primary = valuation.get("primary_method", {})
+    method = primary.get("name")
+    if not method:
+        return
+    currency = valuation.get("currency", "USD")
+
+    if method == "DCF":
+        _section(story, "DCF triangulation",
+                 "Bear / Base / Bull scenarios · WACC × terminal growth × FCF growth path",
+                 styles)
+        scenarios = valuation.get("scenarios", [])
+        rows = [["Scenario", "WACC", "Terminal g", "FCF path", "Implied px"]]
+        for s in scenarios:
+            kc = s.get("key_changes", {}) or {}
+            wacc = kc.get("wacc")
+            tg = kc.get("terminal_g") or kc.get("terminal_growth")
+            fcf_mult = kc.get("fcf_multiplier")
             rows.append([
-                p["ticker"],
-                f"{p.get('pe_ntm', 0):.1f}x" if p.get("pe_ntm") is not None else "—",
-                f"{p.get('ev_ebitda', 0):.1f}x" if p.get("ev_ebitda") is not None else "—",
-                fmt_pct(p.get("rev_growth_ttm", 0) / 100 if p.get("rev_growth_ttm") is not None else None),
-                fmt_pct(p.get("ytd", 0) / 100 if p.get("ytd") is not None else None),
-                fmt_pct(p.get("y1", 0) / 100 if p.get("y1") is not None else None),
+                s.get("label", ""),
+                fmt_pct(wacc * 100, 1) if wacc else "(base)",
+                fmt_pct(tg * 100, 1) if tg else "(base)",
+                f"×{fcf_mult:.2f}" if fcf_mult else "(base FCF)",
+                fmt_currency(s.get("implied_px"), currency),
             ])
-            if p.get("highlight"):
-                highlight_rows.append(len(rows) - 1)
-        peers_table = Table(rows, colWidths=[2.5 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm])
-        base_style = [
+        # Current price row
+        rows.append(["Current price", "", "", "", fmt_currency(valuation.get("current_price"), currency)])
+        t = Table(rows, colWidths=[2.5 * cm, 2 * cm, 2 * cm, 6.5 * cm, 3 * cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("BACKGROUND", (0, -1), (-1, -1), C_LIGHTER),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ]))
+        story.append(t)
+    elif method == "DDM":
+        _section(story, "Bank valuation (DDM)",
+                 "Multi-stage DDM + Excess Returns + Justified P/B",
+                 styles)
+        outputs = primary.get("outputs", {}) or {}
+        rows = [["Method", "Implied value"]]
+        rows.append(["DDM", fmt_currency(outputs.get("ddm", {}).get("implied_value"), currency)])
+        rows.append(["Excess Returns", fmt_currency(outputs.get("excess_returns", {}).get("implied_value"), currency)])
+        jpb = outputs.get("justified_pb", {})
+        rows.append([f"Justified P/B ({jpb.get('ratio'):.2f}x BV)" if jpb.get("ratio") else "Justified P/B",
+                     fmt_currency(jpb.get("implied_value"), currency)])
+        rows.append(["BLENDED (40/40/20)", fmt_currency(outputs.get("implied_px"), currency)])
+        rows.append(["Current price", fmt_currency(valuation.get("current_price"), currency)])
+        t = Table(rows, colWidths=[10 * cm, 6 * cm])
+        t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
             ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
             ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
-            ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("BACKGROUND", (0, -2), (-1, -2), C_HILITE),
+            ("FONTNAME", (0, -2), (-1, -2), "Helvetica-Bold"),
+            ("BACKGROUND", (0, -1), (-1, -1), C_LIGHTER),
+            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
             ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]
-        for hr in highlight_rows:
-            base_style.append(("BACKGROUND", (0, hr), (-1, hr), C_HILITE))
-            base_style.append(("FONTNAME", (0, hr), (-1, hr), "Helvetica-Bold"))
-        peers_table.setStyle(TableStyle(base_style))
-        story.append(peers_table)
-        story.append(Spacer(1, 0.3 * cm))
-
-    if narrative.get("peers_read"):
-        story.append(Paragraph("READ", styles["h3"]))
-        story.append(Paragraph(narrative["peers_read"], styles["body"]))
-
-    cc = valuation.get("cross_check")
-    if cc:
-        story.append(Spacer(1, 0.4 * cm))
-        story.append(Paragraph("CROSS-CHECK METHOD", styles["h3"]))
-        cc_inputs = cc.get("inputs", {})
-        cc_outputs = cc.get("outputs", {})
-        cc_text = (
-            f"<b>{cc.get('name', '')}</b><br/>"
-            f"{cc.get('reasoning', '')}<br/><br/>"
-            f"Multiple: <b>{cc_inputs.get('peer_median_multiple', 'n/a')}× {cc_inputs.get('multiple_type', '')}</b>  "
-            f"·  Estimate: {cc_inputs.get('fy_estimate', 'n/a')}  "
-            f"·  Implied price: <b>{fmt_currency(cc_outputs.get('implied_px'), valuation.get('currency', 'USD'))}</b>"
-        )
-        story.append(Paragraph(cc_text, styles["body"]))
-
-
-# ============================================================
-# RISKS PAGE
-# ============================================================
-
-def build_risks_page(story, narrative, styles):
-    risks = narrative.get("key_risks") or []
-    if not risks:
-        return
-    story.append(PageBreak())
-    story.append(Paragraph("KEY STRUCTURAL RISKS", styles["h2"]))
-    story.append(Paragraph(
-        "Risks orthogonal to the bear thesis — what breaks the long term, not just the next print.",
-        styles["muted"]
-    ))
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(t)
     story.append(Spacer(1, 0.3 * cm))
 
-    cat_colors = {
-        "structural": (C_BAD, C_BAD_BG),
-        "cyclical": (C_NEUTRAL, C_NEUTRAL_BG),
-        "regulatory": (colors.HexColor("#3730A3"), colors.HexColor("#E0E7FF")),
-        "execution": (colors.HexColor("#9F1239"), colors.HexColor("#FCE7F3")),
-        "customer": (colors.HexColor("#9A3412"), colors.HexColor("#FED7AA")),
-        "macro": (colors.HexColor("#155E75"), colors.HexColor("#CFFAFE")),
-    }
-    for r in risks[:7]:
-        cat = r.get("category", "structural").lower()
-        fg, bg = cat_colors.get(cat, (C_INK, C_LIGHT))
-        head_table = Table(
-            [[Paragraph(f"<font color=\"{fg.hexval()}\"><b>{cat.upper()}</b></font>", styles["body"]),
-              Paragraph(f"<b>{r.get('title', '')}</b>", styles["body"])]],
-            colWidths=[3.0 * cm, 12.5 * cm]
+
+# ============================================================
+# 12. SYNTHESIS PATHS
+# ============================================================
+
+def add_synthesis_paths(story, narrative, valuation, styles):
+    paths = narrative.get("synthesis_paths") or []
+    if not paths:
+        # Fallback to valuation scenarios if narrative doesn't carry them
+        paths_from_val = valuation.get("scenarios") or []
+        if not paths_from_val:
+            return
+        rationale = valuation.get("blending_logic") or valuation.get("weights_reasoning", "")
+    else:
+        rationale = (narrative.get("recommendation") or {}).get("rationale", "")
+
+    _section(story, "Synthesis — three paths",
+             rationale if rationale else "Probability-weighted outcomes", styles)
+    currency = valuation.get("currency", "USD")
+    for p in paths:
+        label = p.get("label", "")
+        prob = p.get("prob") or p.get("probability")
+        outcome = p.get("outcome_range") or fmt_currency(p.get("implied_px"), currency)
+        desc = p.get("description") or p.get("reasoning", "")
+        ll = label.lower()
+        fg, bg = tone_color("positive" if ll == "bull" else "negative" if ll == "bear" else "neutral")
+        head = Table(
+            [[Paragraph(f"<font color='{fg.hexval()}'><b>{label}  ·  {outcome}</b></font>", styles["body"]),
+              Paragraph(f"<font color='{fg.hexval()}'><b>{prob*100:.0f}% probability</b></font>" if prob else "",
+                        styles["body"])]],
+            colWidths=[10.5 * cm, 6 * cm]
         )
-        head_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (0, 0), bg),
+        head.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), bg),
+            ("BOX", (0, 0), (-1, -1), 0.3, fg),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(head)
+        if desc:
+            story.append(Paragraph(desc, styles["card_body"]))
+        story.append(Spacer(1, 0.12 * cm))
+    story.append(Spacer(1, 0.2 * cm))
+
+
+# ============================================================
+# 13. MANAGEMENT & CAPITAL ALLOCATION
+# ============================================================
+
+def add_management(story, narrative, styles):
+    mgmt = narrative.get("management")
+    if not mgmt:
+        return
+    _section(story, "Management & capital allocation",
+             "Who runs the company · how they deploy capital · recent insider activity",
+             styles)
+    grid = []
+    if mgmt.get("ceo"):
+        grid.append(("CEO", mgmt["ceo"]))
+    if mgmt.get("cfo"):
+        grid.append(("CFO", mgmt["cfo"]))
+    if mgmt.get("insider_ownership_pct") is not None:
+        grid.append(("Insider ownership", f"{mgmt['insider_ownership_pct']:.1f}%"))
+    if grid:
+        rows = [[
+            Paragraph(f"<font color='{C_MUTED.hexval()}' size='7'>{k.upper()}</font>", styles["body"]),
+            Paragraph(f"<b>{v}</b>", styles["body"])
+        ] for k, v in grid]
+        t = Table(rows, colWidths=[3.5 * cm, 13 * cm])
+        t.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 0.15 * cm))
+
+    if mgmt.get("capital_allocation_history"):
+        _key_callout(story, "CAPITAL ALLOCATION HISTORY", mgmt["capital_allocation_history"], styles)
+
+    if mgmt.get("recent_insider_activity"):
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph("RECENT INSIDER ACTIVITY", styles["h3"]))
+        rows = [["Date", "Insider", "Action", "Value"]]
+        for a in mgmt["recent_insider_activity"]:
+            val_m = a.get("value_usd_m", 0)
+            rows.append([
+                a.get("date", ""),
+                a.get("insider", ""),
+                a.get("action", ""),
+                f"{'+' if val_m > 0 else ''}${abs(val_m):.1f}M",
+            ])
+        t = Table(rows, colWidths=[2.5 * cm, 5.5 * cm, 4 * cm, 4.5 * cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_HEADER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("BOX", (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
+            ("ALIGN", (3, 1), (3, -1), "RIGHT"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
             ("RIGHTPADDING", (0, 0), (-1, -1), 5),
             ("TOPPADDING", (0, 0), (-1, -1), 3),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ]))
-        story.append(head_table)
-        story.append(Paragraph(r.get("description", ""), styles["body"]))
-        story.append(Spacer(1, 0.25 * cm))
+        story.append(t)
+    story.append(Spacer(1, 0.3 * cm))
 
 
 # ============================================================
-# METHODOLOGY / REASONING PAGE
+# 14. SOCIAL SENTIMENT (optional)
 # ============================================================
 
-def build_methodology_page(story, narrative, valuation, styles):
-    story.append(PageBreak())
-    story.append(Paragraph("METHODOLOGY & REASONING LOG", styles["h2"]))
-    primary = valuation.get("primary_method", {})
-    inputs = primary.get("inputs", {})
+def add_social_sentiment(story, narrative, styles):
+    ss = narrative.get("social_sentiment")
+    if not ss:
+        return
+    has_any = any(ss.get(k) is not None for k in ("bullish_pct", "x_mentions", "reddit_mentions", "summary"))
+    if not has_any:
+        return
+    _section(story, "Social sentiment", "Cross-source signal · Reddit / X / news", styles)
+    chips = []
+    if ss.get("bullish_pct") is not None:
+        chips.append(f"Bullish %: <b>{ss['bullish_pct']:.0f}%</b>")
+    if ss.get("x_mentions") is not None:
+        chips.append(f"X mentions / wk: <b>{ss['x_mentions']:,}</b>")
+    if ss.get("reddit_mentions") is not None:
+        chips.append(f"Reddit / wk: <b>{ss['reddit_mentions']:,}</b>")
+    if chips:
+        story.append(Paragraph("  ·  ".join(chips), styles["body"]))
+    if ss.get("summary"):
+        story.append(Paragraph(ss["summary"], styles["body_justified"]))
+    story.append(Spacer(1, 0.3 * cm))
 
-    sections = []
-    sections.append(("Valuation method", f"{primary.get('name')} — {primary.get('reasoning', '')}"))
-    if primary.get("name") == "DCF":
-        wacc = inputs.get("wacc", {})
-        sections.append(("WACC reasoning", wacc.get("reasoning", "")))
-        sections.append(("Terminal growth reasoning", inputs.get("terminal_growth", {}).get("reasoning", "")))
-    elif primary.get("name") == "DDM":
-        for key, label in [("rf_reasoning", "Rf"), ("erp_reasoning", "ERP"),
-                            ("beta_reasoning", "Beta"), ("d0_reasoning", "Sustainable D0"),
-                            ("g_terminal_reasoning", "Terminal growth"), ("g_high_reasoning", "High-growth period"),
-                            ("g_book_reasoning", "Book value growth")]:
-            r_text = inputs.get(key, "")
-            if r_text:
-                sections.append((label, r_text))
-    cc = valuation.get("cross_check")
-    if cc:
-        sections.append(("Cross-check", f"{cc.get('name')} — {cc.get('reasoning', '')}"))
-    sections.append(("Weights reasoning",
-                     valuation.get("weights_reasoning") or valuation.get("blending_logic", "")))
 
-    if narrative.get("data_gaps"):
-        sections.append(("Data gaps from this cycle", " | ".join(narrative["data_gaps"])))
+# ============================================================
+# 15. RECOMMENDATION TABLE
+# ============================================================
 
-    for label, value in sections:
-        story.append(Paragraph(label.upper(), styles["h3"]))
-        story.append(Paragraph(value, styles["body"]))
-        story.append(Spacer(1, 0.2 * cm))
+def add_recommendation_table(story, narrative, styles):
+    table_data = narrative.get("recommendation_table") or []
+    if not table_data:
+        return
+    _section(story, "Recommendation", "Action by holder type", styles)
+    rows = []
+    for r in table_data:
+        rows.append([
+            Paragraph(f"<font color='{C_MUTED.hexval()}' size='7'>{r.get('action', '').upper()}</font>", styles["body"]),
+            Paragraph(f"<b>{r.get('detail', '')}</b>", styles["body"]),
+        ])
+    t = Table(rows, colWidths=[4 * cm, 12.5 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), C_LIGHTER),
+        ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, C_BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 0.3 * cm))
+
+
+# ============================================================
+# 16. CATALYSTS TO WATCH
+# ============================================================
+
+def add_catalysts_to_watch(story, narrative, styles):
+    catalysts = narrative.get("catalysts_to_watch") or []
+    if not catalysts:
+        return
+    _section(story, "Catalysts to watch", "", styles)
+    for c in catalysts:
+        story.append(Paragraph(f"• {c}", styles["thesis_bullet"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+
+# ============================================================
+# 17. DATA GAPS
+# ============================================================
+
+def add_data_gaps(story, narrative, styles):
+    gaps = narrative.get("data_gaps") or []
+    if not gaps:
+        return
+    _section(story, "Data gaps", "What this cycle could not pull · to be filled next run", styles)
+    for g in gaps:
+        story.append(Paragraph(f"<font color='{C_MUTED.hexval()}'>• {g}</font>", styles["body"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def _section(story, title, subtitle, styles):
+    """Section header: dark band with title + light subtitle."""
+    box_data = [[Paragraph(f"<b>{title}</b>", styles["section"])]]
+    if subtitle:
+        box_data.append([Paragraph(subtitle, styles["section_subtitle"])])
+    t = Table(box_data, colWidths=[16.5 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), C_LIGHTER),
+        ("BOX", (0, 0), (-1, -1), 0.3, C_BORDER),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, C_BORDER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 0.1 * cm))
+
+
+def _key_callout(story, label, body, styles, color=C_MUTED, bg=C_LIGHTER):
+    """A bordered callout box with an uppercase label and body text."""
+    p = Paragraph(
+        f"<font color='{color.hexval()}' size='7'><b>{label}</b></font><br/>"
+        f"<font color='{C_TEXT.hexval()}'>{body}</font>",
+        styles["body"]
+    )
+    t = Table([[p]], colWidths=[16.5 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), bg),
+        ("LINEBEFORE", (0, 0), (0, -1), 3, color),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(t)
+
+
+def _callout_paragraph(text, styles, color=C_BAD, bg=C_BAD_BG):
+    """Build a colored callout for the bear paragraph."""
+    p = Paragraph(text, styles["body_justified"])
+    t = Table([[p]], colWidths=[16.5 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), bg),
+        ("BOX", (0, 0), (-1, -1), 0.3, color),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return t
+
+
+def _numbered_card(story, card, styles, color, bg):
+    """A numbered catalyst/breaker card: small color chip with number + title and body."""
+    num = card.get("id", "")
+    title = card.get("title", "")
+    body = card.get("body", "")
+    head = Table(
+        [[
+            Paragraph(f"<font color='{color.hexval()}' size='12'><b>{num}</b></font>", styles["body"]),
+            Paragraph(f"<b>{title}</b>", styles["body"]),
+        ]],
+        colWidths=[1.0 * cm, 15.5 * cm]
+    )
+    head.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), bg),
+        ("ALIGN", (0, 0), (0, 0), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(head)
+    if body:
+        story.append(Paragraph(body, styles["card_body"]))
+    story.append(Spacer(1, 0.15 * cm))
 
 
 # ============================================================
@@ -793,21 +1010,31 @@ def main():
     doc = SimpleDocTemplate(
         str(output_path), pagesize=A4,
         leftMargin=2 * cm, rightMargin=2 * cm,
-        topMargin=2 * cm, bottomMargin=1.8 * cm,
+        topMargin=1.9 * cm, bottomMargin=1.6 * cm,
         title=f"{narrative['ticker']} — {narrative['name']}",
         author="IntelliDesk Equity Research",
     )
 
     story = []
-    build_cover_page(story, narrative, valuation, styles)
-    build_valuation_page(story, narrative, valuation, styles)
-    build_scenarios_page(story, narrative, valuation, styles)
-    build_bull_bear_page(story, narrative, styles)
-    build_peers_page(story, narrative, valuation, styles)
-    build_risks_page(story, narrative, styles)
-    build_methodology_page(story, narrative, valuation, styles)
+    add_header(story, narrative, valuation, styles)
+    add_thesis(story, narrative, styles)
+    add_key_numbers(story, narrative, styles)
+    add_business_overview(story, narrative, styles)
+    add_historical_financials(story, narrative, styles)
+    add_industry_position(story, narrative, styles)
+    add_bull_catalysts(story, narrative, styles)
+    add_bear_breakers(story, narrative, styles)
+    add_key_risks(story, narrative, styles)
+    add_peers(story, narrative, styles)
+    add_valuation_summary(story, narrative, valuation, styles)
+    add_synthesis_paths(story, narrative, valuation, styles)
+    add_management(story, narrative, styles)
+    add_social_sentiment(story, narrative, styles)
+    add_recommendation_table(story, narrative, styles)
+    add_catalysts_to_watch(story, narrative, styles)
+    add_data_gaps(story, narrative, styles)
 
-    handler = _draw_header_footer(narrative["ticker"], narrative["name"], styles)
+    handler = _draw_header_footer(narrative["ticker"], narrative["name"])
     doc.build(story, onFirstPage=handler, onLaterPages=handler)
     print(f"[OK] wrote {output_path}")
 
