@@ -14,7 +14,8 @@ Every research request produces **three files** in `output/<TICKER>/`:
 
 1. **`<TICKER>.json`** — narrative report (thesis, catalysts, bear case, peers, business overview, etc). Matches `_schema/SPEC_v2.md`.
 2. **`<TICKER>_valuation.json`** — pure math (assumptions with reasoning, scenarios with probabilities + reasoning, computed outputs, calculation_trace, sensitivity matrix). Matches `_schema/VALUATION_SCHEMA.md`. **Produced by running a Python compute script** — never by Claude inventing numbers.
-3. **`<TICKER>.xlsx`** — Excel artifact rendered from the two JSONs by `_schema/render_excel.py`. **Locked 8-tab template** — never produced by `anthropic-skills:xlsx` or any other freeform Excel skill.
+3. **`<TICKER>.xlsx`** — Excel artifact rendered from the two JSONs by `_schema/render_excel.py`. **Locked 10-tab template** — never produced by `anthropic-skills:xlsx` or any other freeform Excel skill.
+4. **`<TICKER>.pdf`** — PDF artifact rendered from the two JSONs by `_schema/render_pdf.py`. **Locked 7-section template** — never produced by `anthropic-skills:pdf` or any other freeform PDF skill.
 
 After producing the three files, Claude returns ONLY:
 - The three file paths
@@ -130,13 +131,18 @@ python _schema/voice_clean.py output/<TICKER>/<TICKER>.json
 
 Zero em-dashes. No AI tells. Read `_schema/VOICE.md` if you're about to write any prose by hand.
 
-### Step 9 — Render the Excel artifact
+### Step 9 — Render the Excel and PDF artifacts
 
 ```bash
 python _schema/render_excel.py --ticker <T> --category <AI or IDX or other>
+python _schema/render_pdf.py   --ticker <T> --category <AI or IDX or other>
 ```
 
-This reads both JSONs and produces `output/<TICKER>/<TICKER>.xlsx` with 7 locked tabs: Cover, Assumptions, Calculation, Sensitivity, Scenarios (with probability weights + final target calc), Peers, Reasoning Log. Same JSON → same xlsx every time.
+Excel: 10-tab locked layout (Cover / Market Stats / Historicals / Assumptions / WACC & DCF / Formula trace / Sensitivity / Relative & SOTP / Scenarios / Reasoning log).
+
+PDF: 7-section locked layout (Cover page tear sheet / Valuation page with WACC adjudication + FCFF build + dual TV / Scenarios with probability weights / Bull-bear catalysts / Peers + cross-check / Key risks / Methodology & reasoning).
+
+Same JSON → same xlsx and same PDF every time, across every Claude session.
 
 ### Step 10 — Tell the user
 
